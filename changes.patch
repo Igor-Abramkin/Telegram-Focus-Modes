@@ -1,0 +1,3953 @@
+diff --git a/Telegram/BUILD b/Telegram/BUILD
+index 1ac8279b..a9292579 100644
+--- a/Telegram/BUILD
++++ b/Telegram/BUILD
+@@ -571,6 +571,14 @@ official_notification_filtering_fragment = """
+ """
+ notification_filtering_fragment = official_notification_filtering_fragment if telegram_bundle_id == "ph.telegra.Telegraph" else ""
+ 
++# Focus Modes: chats in Always Notify are delivered as Time Sensitive, which is what lets them through an iOS Focus.
++# The capability has to be enabled for the App ID before this ships.
++official_time_sensitive_notifications_fragment = """
++<key>com.apple.developer.usernotifications.time-sensitive</key>
++<true/>
++"""
++time_sensitive_notifications_fragment = official_time_sensitive_notifications_fragment if telegram_bundle_id in official_bundle_ids else ""
++
+ store_signin_fragment = """
+ <key>com.apple.developer.applesignin</key>
+ <array>
+@@ -599,6 +607,7 @@ plist_fragment(
+         carplay_fragment,
+         communication_notifications_fragment,
+         notification_filtering_fragment,
++        time_sensitive_notifications_fragment,
+         signin_fragment,
+         background_gpu_fragment,
+     ])
+@@ -987,6 +996,7 @@ framework_exported_symbols(
+         ":NotificationContentExtensionLib",
+         ":BroadcastUploadExtensionLib",
+         "//Telegram/NotificationService:NotificationServiceExtensionLib",
++        "//submodules/FocusModes:FocusFilterIntent",
+     ],
+ )
+ 
+@@ -1958,9 +1968,14 @@ ios_application(
+         ":embedWatchAppSetting": ":TelegramWatchApp",
+         "//conditions:default": None,
+     }),
++    # The Focus Filter (Settings > Focus > Focus Filters > Telegram) lives in the app binary.
++    app_intents = [
++        "//submodules/FocusModes:FocusFilterIntent",
++    ],
+     deps = [
+         ":Main",
+         ":Lib",
++        "//submodules/FocusModes:FocusFilterIntent",
+     ],
+     visibility = ["//visibility:public"],
+ )
+diff --git a/Telegram/NotificationService/BUILD b/Telegram/NotificationService/BUILD
+index b5e1dec1..1a621ddc 100644
+--- a/Telegram/NotificationService/BUILD
++++ b/Telegram/NotificationService/BUILD
+@@ -26,6 +26,7 @@ swift_library(
+         "//submodules/Utils/RangeSet",
+         "//submodules/Media/ConvertOpusToAAC",
+         "//submodules/PasscodeCore",
++        "//submodules/FocusModes:FocusModes",
+     ],
+     visibility = [
+         "//visibility:public",
+diff --git a/Telegram/NotificationService/Sources/NotificationService.swift b/Telegram/NotificationService/Sources/NotificationService.swift
+index 5c7a99fa..d3744a83 100644
+--- a/Telegram/NotificationService/Sources/NotificationService.swift
++++ b/Telegram/NotificationService/Sources/NotificationService.swift
+@@ -20,6 +20,7 @@ import RangeSet
+ import ConvertOpusToAAC
+ import CoreServices
+ import ImageIO
++import FocusModes
+ import UniformTypeIdentifiers
+ 
+ private let queue = Queue()
+@@ -517,6 +518,8 @@ private struct NotificationContent: CustomStringConvertible {
+     var userInfo: [AnyHashable: Any] = [:]
+     var attachments: [UNNotificationAttachment] = []
+     var silent = false
++    /// What Focus Modes make of the chat: delivered quietly, or as Time Sensitive.
++    var focusDecision: FocusNotificationDecision = .regular
+     /// The account this notification was delivered to, set only while more than one is signed
+     /// in (see `notificationRecipientAccountName`).
+     var recipientAccountName: String?
+@@ -732,6 +735,22 @@ private struct NotificationContent: CustomStringConvertible {
+             }
+         }
+ 
++        // After the intent: `updating(from:)` returns a new content.
++        if #available(iOS 15.0, *) {
++            switch self.focusDecision {
++            case .regular:
++                break
++            case .silenced:
++                // To Notification Center without sound, banner or lighting the screen, as an iOS Focus does it.
++                content.interruptionLevel = .passive
++                content.sound = nil
++                content.relevanceScore = 0.0
++            case .alwaysNotify:
++                content.interruptionLevel = .timeSensitive
++                content.relevanceScore = 1.0
++            }
++        }
++
+         return content
+     }
+ }
+@@ -1286,6 +1305,13 @@ private final class NotificationServiceHandler {
+ 
+                             content.userInfo["peerId"] = "\(peerId.toInt64())"
+                             content.userInfo["accountId"] = "\(recordId.int64)"
++
++                            let focusSettings = FocusModesStore.loadSettings(rootPath: rootPath)
++                            let focusSystemState = FocusModesStore.loadSystemState(rootPath: rootPath)
++                            content.focusDecision = focusSettings.notificationDecision(peerId: peerId.toInt64(), systemState: focusSystemState, at: Date())
++                            if content.focusDecision != .regular {
++                                Logger.shared.log("NotificationService \(episode)", "Focus Modes: \(content.focusDecision)")
++                            }
+                             
+                             if let silentString = payloadJson["silent"] as? String {
+                                 if let silentValue = Int(silentString), silentValue != 0 {
+diff --git a/Telegram/Telegram-iOS/en.lproj/Localizable.strings b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+index 0c6e4e28..16c964b6 100644
+--- a/Telegram/Telegram-iOS/en.lproj/Localizable.strings
++++ b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+@@ -17342,3 +17342,92 @@ Error: %8$@";
+ "VoiceOver.Reactions.ShowAll" = "Show All Reactions";
+ "VoiceOver.Reactions.Premium" = "Premium Reactions";
+ "VoiceOver.Passcode.Incorrect" = "Incorrect passcode. Please try again.";
++
++"FocusModes.Title" = "Focus Modes";
++"FocusModes.NotificationsRowInfo" = "Quiet chats by schedule or Focus";
++"FocusModes.RowActive" = "%@ is on";
++"FocusModes.ToastOnTitle" = "%@ is on";
++"FocusModes.ToastOffTitle" = "%@ is off";
++"FocusModes.ToastHiding" = "Hiding %@.";
++"FocusModes.ToastMuting" = "Muting %@.";
++"FocusModes.ToastMutingAll" = "Muting all chats.";
++"FocusModes.ToastNothing" = "Add chats or folders to this mode to quiet them.";
++"FocusModes.ToastOffText" = "Hidden chats are back and notify you as usual.";
++"FocusModes.NotificationsInfo" = "Mute work chats in the evening, keep family chats loud. Modes can follow your iOS Focus.";
++"FocusModes.ActiveHeader" = "Now";
++"FocusModes.NoActiveMode" = "No Mode";
++"FocusModes.TurnOn" = "Turn On a Mode";
++"FocusModes.TurnOff" = "Turn Off";
++"FocusModes.SwitchMode" = "Switch Mode";
++"FocusModes.ActiveInfoOn" = "%@ is on. Its chats arrive quietly in Notification Center, without sound or banner.";
++"FocusModes.ActiveInfoOff" = "A mode turns on with its schedule, with an iOS Focus, or here.";
++"FocusModes.SourceManual" = "Turned on in Telegram";
++"FocusModes.SourceManualUntil" = "On until %@";
++"FocusModes.SourceSystem" = "On with iOS Focus";
++"FocusModes.SourceSchedule" = "On by schedule";
++"FocusModes.On" = "On";
++"FocusModes.ModesHeader" = "Modes";
++"FocusModes.AddMode" = "Add Mode";
++"FocusModes.ModesInfo" = "To switch modes with iOS, open Settings > Focus, choose a Focus, tap Add Filter and pick Telegram.";
++"FocusModes.ModeSummaryAll" = "Silences all chats";
++"FocusModes.ModeSummaryEmpty" = "No chats added";
++"FocusModes.ModeSummarySilences" = "Silences %@";
++"FocusModes.ModeSummaryHides" = "Hides %@";
++"FocusModes.HideHeader" = "Hide from Chat List";
++"FocusModes.HideTitle" = "Hide Chats";
++"FocusModes.HideInfo" = "While this mode is on, these chats disappear from your chat list and these folders lose their tab. Their messages arrive quietly. Chats in Always Notify stay visible.";
++"FocusModes.And" = "and";
++"FocusModes.ChatCount_0" = "%@ chats";
++"FocusModes.ChatCount_1" = "%@ chat";
++"FocusModes.ChatCount_2" = "%@ chats";
++"FocusModes.ChatCount_3_10" = "%@ chats";
++"FocusModes.ChatCount_many" = "%@ chats";
++"FocusModes.ChatCount_any" = "%@ chats";
++"FocusModes.AlwaysNotifyHeader" = "Always Notify";
++"FocusModes.AlwaysNotifyTitle" = "Always Notify";
++"FocusModes.AddChatsOrFolders" = "Add Chats or Folders";
++"FocusModes.AlwaysNotifyInfo" = "These chats notify you in every mode. They arrive as Time Sensitive, so they also reach you through an iOS Focus.";
++"FocusModes.ShowMuted" = "Show as Muted in Chat List";
++"FocusModes.ShowMutedInfo" = "While a mode is on, the chats it silences show the muted icon.";
++"FocusModes.FoldersSection" = "Folders";
++"FocusModes.ChooseMode" = "Choose a mode";
++"FocusModes.TurnOnModeTitle" = "Turn on %@";
++"FocusModes.ForOneHour" = "For 1 Hour";
++"FocusModes.UntilThisEvening" = "Until This Evening";
++"FocusModes.UntilTomorrowMorning" = "Until Tomorrow Morning";
++"FocusModes.UntilTurnedOff" = "Until I Turn It Off";
++"FocusModes.NewMode" = "New Mode";
++"FocusModes.NameHeader" = "Name";
++"FocusModes.NamePlaceholder" = "Mode Name";
++"FocusModes.IconHeader" = "Icon";
++"FocusModes.SilenceHeader" = "Silence Notifications From";
++"FocusModes.SilenceTitle" = "Silence Chats";
++"FocusModes.SilenceAll" = "All Chats";
++"FocusModes.SilenceAllInfo" = "Every chat goes quiet except the ones in Always Notify.";
++"FocusModes.SilenceInfo" = "While this mode is on, messages from these chats and folders arrive without sound or banner. You still find them in Notification Center.";
++"FocusModes.ScheduleHeader" = "Turn On Automatically";
++"FocusModes.AddSchedule" = "Add Schedule";
++"FocusModes.ScheduleInfo" = "To turn this mode on with an iOS Focus, add the Telegram filter to that Focus in Settings > Focus.";
++"FocusModes.TurnOnNow" = "Turn On Now";
++"FocusModes.DeleteMode" = "Delete Mode";
++"FocusModes.DeleteModeConfirmation" = "Chats in this mode will notify you as usual again.";
++"FocusModes.ScheduleTitle" = "Schedule";
++"FocusModes.DaysHeader" = "Days";
++"FocusModes.TimeHeader" = "Time";
++"FocusModes.AllDay" = "All Day";
++"FocusModes.From" = "From";
++"FocusModes.To" = "To";
++"FocusModes.ScheduleNextDayInfo" = "Ends the next day at %@.";
++"FocusModes.DeleteSchedule" = "Delete Schedule";
++"FocusModes.EveryDay" = "Every day";
++"FocusModes.Weekdays" = "Weekdays";
++"FocusModes.Weekends" = "Weekends";
++"FocusModes.Symbol.Work" = "Work";
++"FocusModes.Symbol.Personal" = "Personal";
++"FocusModes.Symbol.Sleep" = "Sleep";
++"FocusModes.Symbol.DoNotDisturb" = "Do Not Disturb";
++"FocusModes.Symbol.Fitness" = "Fitness";
++"FocusModes.Symbol.Reading" = "Reading";
++"FocusModes.Symbol.Driving" = "Driving";
++"FocusModes.Symbol.Gaming" = "Gaming";
++"FocusModes.Symbol.Mindfulness" = "Mindfulness";
+diff --git a/submodules/ChatListUI/BUILD b/submodules/ChatListUI/BUILD
+index 58a001c6..e7c912e1 100644
+--- a/submodules/ChatListUI/BUILD
++++ b/submodules/ChatListUI/BUILD
+@@ -12,6 +12,8 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/FocusModes:FocusModes",
++        "//submodules/FocusModes:FocusModesSignals",
+         "//submodules/SSignalKit/SwiftSignalKit:SwiftSignalKit",
+         "//submodules/AsyncDisplayKit:AsyncDisplayKit",
+         "//submodules/Display:Display",
+diff --git a/submodules/ChatListUI/Sources/ChatListController.swift b/submodules/ChatListUI/Sources/ChatListController.swift
+index 1ef2cfaf..54c581e7 100644
+--- a/submodules/ChatListUI/Sources/ChatListController.swift
++++ b/submodules/ChatListUI/Sources/ChatListController.swift
+@@ -64,6 +64,8 @@ import GlobalControlPanelsContext
+ import AlertComponent
+ import AlertHeaderComponent
+ import AvatarComponent
++import FocusModes
++import FocusModesSignals
+ 
+ private final class ContextControllerContentSourceImpl: ContextControllerContentSource {
+     let controller: ViewController
+@@ -212,6 +214,11 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+     
+     private let stateDisposable = MetaDisposable()
+     private let filterDisposable = MetaDisposable()
++    private var focusModesDisposable: Disposable?
++    private var latestFocusModes: FocusModesState?
++    private var isOnScreenForFocusModes = false
++    /// Set when the user turns a mode off from its own toast, which needs no second toast to say so.
++    private var skipNextFocusModesToast = false
+     private let featuredFiltersDisposable = MetaDisposable()
+     private var processedFeaturedFilters = false
+     
+@@ -814,6 +821,19 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+                 }
+             }
+             self.reloadFilters()
++            
++            // Focus Modes: follow the stored state, but show a change only while the chat list is on screen.
++            let focusModesRootPath = self.context.sharedContext.basePath
++            self.focusModesDisposable = (focusModesState(rootPath: focusModesRootPath)
++            |> deliverOnMainQueue).startStrict(next: { [weak self] state in
++                guard let self else {
++                    return
++                }
++                self.latestFocusModes = state
++                if self.isOnScreenForFocusModes {
++                    self.presentLatestFocusModes()
++                }
++            })
+         }
+         
+         self.storiesPostingAvailabilityDisposable = (self.context.engine.data.subscribe(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: PreferencesKeys.appConfiguration))
+@@ -851,6 +871,7 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+     }
+     
+     deinit {
++        self.focusModesDisposable?.dispose()
+         self.openMessageFromSearchDisposable.dispose()
+         self.badgeDisposable?.dispose()
+         self.badgeIconDisposable?.dispose()
+@@ -2447,6 +2468,17 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+     
+     override public func viewDidAppear(_ animated: Bool) {
+         super.viewDidAppear(animated)
++        
++        if case .chatList(.root) = self.location {
++            self.isOnScreenForFocusModes = true
++            // Let the screen settle first, so the hiding is seen rather than missed in the transition.
++            Queue.mainQueue().after(0.6, { [weak self] in
++                guard let self, self.isOnScreenForFocusModes else {
++                    return
++                }
++                self.presentLatestFocusModes()
++            })
++        }
+                 
+         if self.powerSavingMonitoringDisposable == nil {
+             self.powerSavingMonitoringDisposable = (self.context.sharedContext.automaticMediaDownloadSettings
+@@ -2940,6 +2972,8 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+     override public func viewDidDisappear(_ animated: Bool) {
+         super.viewDidDisappear(animated)
+         
++        self.isOnScreenForFocusModes = false
++        
+         if self.dismissSearchOnDisappear {
+             self.dismissSearchOnDisappear = false
+             self.deactivateSearch(animated: false)
+@@ -4105,9 +4139,79 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+         self.presentInGlobalOverlay(contextController)
+     }
+     
++    /// Moves the chat list to the latest Focus Modes state, which hides and mutes in front of the user, and says what
++    /// happened when the active mode changed.
++    private func presentLatestFocusModes() {
++        guard let latest = self.latestFocusModes else {
++            return
++        }
++        let accountPeerId = self.context.account.peerId.toInt64()
++        let rootPath = self.context.sharedContext.basePath
++        let presentation = FocusModesChatListPresentation.forAccount(accountPeerId, rootPath: rootPath)
++        let previous = presentation.current
++        if previous == latest {
++            return
++        }
++        presentation.set(latest)
++        
++        if previous.activeMode?.mode.id == latest.activeMode?.mode.id {
++            return
++        }
++        if self.skipNextFocusModesToast {
++            self.skipNextFocusModesToast = false
++            return
++        }
++        guard let (title, text) = focusModesToastText(previous: previous.activeMode, current: latest.activeMode, accountPeerId: accountPeerId, strings: self.presentationData.strings) else {
++            return
++        }
++        var canTurnOff = false
++        if let activeMode = latest.activeMode, case .manual = activeMode.source {
++            canTurnOff = true
++        }
++        let iconColor = UIColor.white
++        let animation = latest.activeMode != nil ? "anim_profilemute" : "anim_profileunmute"
++        self.present(UndoOverlayController(presentationData: self.presentationData, content: .universal(animation: animation, scale: 0.075, colors: [
++            "Middle.Group 1.Fill 1": iconColor,
++            "Top.Group 1.Fill 1": iconColor,
++            "Bottom.Group 1.Fill 1": iconColor,
++            "EXAMPLE.Group 1.Fill 1": iconColor,
++            "Line.Group 1.Stroke 1": iconColor
++        ], title: title, text: text, customUndoText: canTurnOff ? self.presentationData.strings.FocusModes_TurnOff : nil, timeout: 5.0), elevatedLayout: false, animateInAsReplacement: false, action: { [weak self] action in
++            if case .undo = action {
++                self?.skipNextFocusModesToast = true
++                let _ = updateFocusModesSettings(rootPath: rootPath, { settings in
++                    var settings = settings
++                    settings.manualActivation = nil
++                    return settings
++                }).start()
++            }
++            return false
++        }), in: .current)
++    }
++    
+     private var initializedFilters = false
+     private func reloadFilters(firstUpdate: (() -> Void)? = nil) {
+-        let filterItems = chatListFilterItems(context: self.context)
++        // Focus Modes: the folders a mode hides lose their tab while it is on.
++        let accountPeerId = self.context.account.peerId.toInt64()
++        let filterItems = combineLatest(
++            chatListFilterItems(context: self.context),
++            FocusModesChatListPresentation.forAccount(accountPeerId, rootPath: self.context.sharedContext.basePath).state
++            |> map { state -> Set<Int32> in
++                return state.hiddenFolderIds(accountPeerId: accountPeerId)
++            }
++            |> distinctUntilChanged
++        )
++        |> map { countAndFilterItems, hiddenFolderIds -> (Int, [(ChatListFilter, Int, Bool)]) in
++            if hiddenFolderIds.isEmpty {
++                return countAndFilterItems
++            }
++            return (countAndFilterItems.0, countAndFilterItems.1.filter { item in
++                if case let .filter(id, _, _, _) = item.0 {
++                    return !hiddenFolderIds.contains(id)
++                }
++                return true
++            })
++        }
+         var notifiedFirstUpdate = false
+         self.filterDisposable.set((combineLatest(queue: .mainQueue(),
+             filterItems,
+diff --git a/submodules/ChatListUI/Sources/ChatListFilterPresetCategoryItem.swift b/submodules/ChatListUI/Sources/ChatListFilterPresetCategoryItem.swift
+index dce657d5..93c8182a 100644
+--- a/submodules/ChatListUI/Sources/ChatListFilterPresetCategoryItem.swift
++++ b/submodules/ChatListUI/Sources/ChatListFilterPresetCategoryItem.swift
+@@ -10,7 +10,7 @@ import AccountContext
+ import TelegramPresentationData
+ import ChatListSearchItemHeader
+ 
+-enum ChatListFilterCategoryIcon {
++public enum ChatListFilterCategoryIcon {
+     case contacts
+     case nonContacts
+     case groups
+@@ -19,24 +19,26 @@ enum ChatListFilterCategoryIcon {
+     case muted
+     case read
+     case archived
++    /// A chat folder, as Focus Modes lists one.
++    case folder
+ }
+ 
+-final class ChatListFilterPresetCategoryItem: ListViewItem, ItemListItem, ItemListRevealOptionsStatefulItem {
++public final class ChatListFilterPresetCategoryItem: ListViewItem, ItemListItem, ItemListRevealOptionsStatefulItem {
+     let presentationData: ItemListPresentationData
+     let systemStyle: ItemListSystemStyle
+     let title: String
+     let icon: ChatListFilterCategoryIcon
+     let isRevealed: Bool
+-    let selectable: Bool = false
+-    let sectionId: ItemListSectionId
++    public let selectable: Bool = false
++    public let sectionId: ItemListSectionId
+     let updatedRevealedOptions: (Bool) -> Void
+     let remove: () -> Void
+ 
+-    var hasActiveRevealOptions: Bool {
++    public var hasActiveRevealOptions: Bool {
+         return self.isRevealed
+     }
+     
+-    init(
++    public init(
+         presentationData: ItemListPresentationData,
+         systemStyle: ItemListSystemStyle,
+         title: String,
+@@ -56,7 +58,7 @@ final class ChatListFilterPresetCategoryItem: ListViewItem, ItemListItem, ItemLi
+         self.remove = remove
+     }
+     
+-    func nodeConfiguredForParams(async: @escaping (@escaping () -> Void) -> Void, params: ListViewItemLayoutParams, synchronousLoads: Bool, neighbors: ListViewItemNeighbors, completion: @escaping (ListViewItemNode, @escaping () -> (Signal<Void, NoError>?, (ListViewItemApply) -> Void)) -> Void) {
++    public func nodeConfiguredForParams(async: @escaping (@escaping () -> Void) -> Void, params: ListViewItemLayoutParams, synchronousLoads: Bool, neighbors: ListViewItemNeighbors, completion: @escaping (ListViewItemNode, @escaping () -> (Signal<Void, NoError>?, (ListViewItemApply) -> Void)) -> Void) {
+         async {
+             let node = ChatListFilterPresetCategoryItemNode()
+             let (layout, apply) = node.asyncLayout()(self, params, itemListNeighbors(item: self, topFacet: neighbors.previous?.base(ItemListNeighborFacet.self), bottomFacet: neighbors.next?.base(ItemListNeighborFacet.self)), false)
+@@ -72,7 +74,7 @@ final class ChatListFilterPresetCategoryItem: ListViewItem, ItemListItem, ItemLi
+         }
+     }
+     
+-    func updateNode(async: @escaping (@escaping () -> Void) -> Void, node: @escaping () -> ListViewItemNode, params: ListViewItemLayoutParams, neighbors: ListViewItemNeighbors, animation: ListViewItemUpdateAnimation, completion: @escaping (ListViewItemNodeLayout, @escaping (ListViewItemApply) -> Void) -> Void) {
++    public func updateNode(async: @escaping (@escaping () -> Void) -> Void, node: @escaping () -> ListViewItemNode, params: ListViewItemLayoutParams, neighbors: ListViewItemNeighbors, animation: ListViewItemUpdateAnimation, completion: @escaping (ListViewItemNodeLayout, @escaping (ListViewItemApply) -> Void) -> Void) {
+         Queue.mainQueue().async {
+             if let nodeValue = node() as? ChatListFilterPresetCategoryItemNode {
+                 let makeLayout = nodeValue.asyncLayout()
+@@ -94,7 +96,7 @@ final class ChatListFilterPresetCategoryItem: ListViewItem, ItemListItem, ItemLi
+         }
+     }
+     
+-    func selected(listView: ListView){
++    public func selected(listView: ListView){
+         listView.clearHighlightAnimated(true)
+     }
+ }
+@@ -269,6 +271,9 @@ class ChatListFilterPresetCategoryItemNode: ItemListRevealOptionsItemNode, ItemL
+                         case .archived:
+                             color = .yellow
+                             imageName = "Chat List/Filters/Archive"
++                        case .folder:
++                            color = .blue
++                            imageName = "Chat List/Filters/Chats"
+                         }
+                         updatedAvatarImage = generateAvatarImage(size: CGSize(width: avatarSize, height: avatarSize), icon: generateTintedImage(image: UIImage(bundleImageName: imageName), color: .white), cornerRadius: 12.0, color: color)
+                     }
+diff --git a/submodules/ChatListUI/Sources/FocusModesChatListPresentation.swift b/submodules/ChatListUI/Sources/FocusModesChatListPresentation.swift
+new file mode 100644
+index 00000000..b4c75181
+--- /dev/null
++++ b/submodules/ChatListUI/Sources/FocusModesChatListPresentation.swift
+@@ -0,0 +1,73 @@
++import Foundation
++import SwiftSignalKit
++import TelegramPresentationData
++import FocusModes
++import FocusModesSignals
++
++/// The Focus Modes state the chat list shows, which can lag the stored one. The root chat list moves it forward only
++/// while it is on screen, so a mode turned on in Settings, by a schedule or by an iOS Focus hides its chats and folders
++/// in front of the user when they come back, instead of while they were away.
++final class FocusModesChatListPresentation {
++    private static var byAccount: [Int64: FocusModesChatListPresentation] = [:]
++
++    static func forAccount(_ accountPeerId: Int64, rootPath: String) -> FocusModesChatListPresentation {
++        if let current = self.byAccount[accountPeerId] {
++            return current
++        }
++        let result = FocusModesChatListPresentation(rootPath: rootPath)
++        self.byAccount[accountPeerId] = result
++        return result
++    }
++
++    private let promise: ValuePromise<FocusModesState>
++    private(set) var current: FocusModesState
++
++    private init(rootPath: String) {
++        let settings = FocusModesStore.loadSettings(rootPath: rootPath)
++        let systemState = FocusModesStore.loadSystemState(rootPath: rootPath)
++        self.current = FocusModesState(settings: settings, systemState: systemState, activeMode: settings.activeMode(systemState: systemState, at: Date()))
++        self.promise = ValuePromise(self.current, ignoreRepeated: true)
++    }
++
++    var state: Signal<FocusModesState, NoError> {
++        return self.promise.get()
++    }
++
++    func set(_ state: FocusModesState) {
++        self.current = state
++        self.promise.set(state)
++    }
++}
++
++/// "Personal is on" and what it does, for the toast the chat list shows when the active mode changes.
++func focusModesToastText(previous: FocusActiveMode?, current: FocusActiveMode?, accountPeerId: Int64, strings: PresentationStrings) -> (title: String, text: String)? {
++    if let current {
++        let mode = current.mode
++        func describe(_ targets: FocusChatTargets) -> String {
++            var parts = targets.folders.filter { $0.accountPeerId == accountPeerId }.map(\.title)
++            if !targets.peerIds.isEmpty {
++                parts.append(strings.FocusModes_ChatCount(Int32(targets.peerIds.count)))
++            }
++            if parts.count > 1 {
++                return parts.dropLast().joined(separator: ", ") + " \(strings.FocusModes_And) " + parts.last!
++            }
++            return parts.first ?? ""
++        }
++        var sentences: [String] = []
++        if !mode.hidden.isEmpty {
++            sentences.append(strings.FocusModes_ToastHiding(describe(mode.hidden)).string)
++        }
++        if mode.silencesAllChats {
++            sentences.append(strings.FocusModes_ToastMutingAll)
++        } else if !mode.silenced.isEmpty {
++            sentences.append(strings.FocusModes_ToastMuting(describe(mode.silenced)).string)
++        }
++        if sentences.isEmpty {
++            sentences.append(strings.FocusModes_ToastNothing)
++        }
++        return (strings.FocusModes_ToastOnTitle(mode.title).string, sentences.joined(separator: " "))
++    } else if let previous {
++        return (strings.FocusModes_ToastOffTitle(previous.mode.title).string, strings.FocusModes_ToastOffText)
++    }
++    return nil
++}
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListNode.swift b/submodules/ChatListUI/Sources/Node/ChatListNode.swift
+index 8dd8056c..77aae29d 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListNode.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListNode.swift
+@@ -23,6 +23,8 @@ import UndoUI
+ import NewSessionInfoScreen
+ import PresentationDataUtils
+ import GlobalControlPanelsContext
++import FocusModes
++import FocusModesSignals
+ 
+ public enum ChatListNodeMode {
+     case chatList(appendContacts: Bool)
+@@ -311,6 +313,8 @@ public struct ChatListNodeState: Equatable {
+     public var selectedPeerMap: [EnginePeer.Id: EnginePeer]
+     public var selectedThreadIds: Set<Int64>
+     public var archiveStoryState: StoryState?
++    /// Chats silenced by the active Focus mode show as muted.
++    public var focusModes: FocusModesState?
+     
+     public init(
+         presentationData: ChatListPresentationData,
+@@ -387,8 +391,22 @@ public struct ChatListNodeState: Equatable {
+         if lhs.archiveStoryState != rhs.archiveStoryState {
+             return false
+         }
++        if lhs.focusModes != rhs.focusModes {
++            return false
++        }
+         return true
+     }
++    
++    func isSilencedByFocusMode(peerId: EnginePeer.Id) -> Bool {
++        guard let focusModes = self.focusModes, focusModes.settings.showSilencedInChatList else {
++            return false
++        }
++        return focusModes.isSilenced(peerId: peerId.toInt64())
++    }
++    
++    func isHiddenByFocusMode(peerId: EnginePeer.Id) -> Bool {
++        return self.focusModes?.isHiddenInChatList(peerId: peerId.toInt64()) ?? false
++    }
+ }
+ 
+ private func mappedInsertEntries(context: AccountContext, nodeInteraction: ChatListNodeInteraction, location: ChatListControllerLocation, isPremium: Bool, filterData: ChatListItemFilterData?, chatListFilters: [ChatListFilter]?, mode: ChatListNodeMode, isPeerEnabled: ((EnginePeer) -> Bool)?, entries: [ChatListNodeViewTransitionInsertEntry], presentationData: ChatListPresentationData) -> [ListViewInsertItem] {
+@@ -1341,6 +1359,7 @@ public final class ChatListNode: ListViewImpl {
+     private let chatListLocation = ValuePromise<ChatListNodeLocation>()
+     private let chatListDisposable = MetaDisposable()
+     private var activityStatusesDisposable: Disposable?
++    private var focusModesDisposable: Disposable?
+     
+     private let scrollToTopOptionPromise = Promise<ChatListGlobalScrollOption>(.none)
+     public var scrollToTopOption: Signal<ChatListGlobalScrollOption, NoError> {
+@@ -2967,6 +2986,26 @@ public final class ChatListNode: ListViewImpl {
+             }
+         })
+         
++        // The chat list follows what the root chat list presents, so changes animate in while it is on screen.
++        // Pickers and other lists follow the stored state directly.
++        let focusModesSignal: Signal<FocusModesState, NoError>
++        if case .chatList = mode, case .chatList = location {
++            focusModesSignal = FocusModesChatListPresentation.forAccount(context.account.peerId.toInt64(), rootPath: context.sharedContext.basePath).state
++        } else {
++            focusModesSignal = focusModesState(rootPath: context.sharedContext.basePath)
++        }
++        self.focusModesDisposable = (focusModesSignal
++        |> deliverOnMainQueue).startStrict(next: { [weak self] focusModes in
++            guard let self else {
++                return
++            }
++            self.updateState { state in
++                var state = state
++                state.focusModes = focusModes
++                return state
++            }
++        })
++        
+         self.reorderItem = { [weak self] fromIndex, toIndex, transactionOpaqueState -> Signal<Bool, NoError> in
+             guard let strongSelf = self, let filteredEntries = (transactionOpaqueState as? ChatListOpaqueTransactionState)?.chatListView.filteredEntries else {
+                 return .single(false)
+@@ -3250,6 +3289,7 @@ public final class ChatListNode: ListViewImpl {
+     deinit {
+         self.chatListDisposable.dispose()
+         self.activityStatusesDisposable?.dispose()
++        self.focusModesDisposable?.dispose()
+         self.updatedFilterDisposable.dispose()
+         self.pollFilterUpdatesDisposable?.dispose()
+         self.chatFilterUpdatesDisposable?.dispose()
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListNodeEntries.swift b/submodules/ChatListUI/Sources/Node/ChatListNodeEntries.swift
+index ec07b0e3..042903c2 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListNodeEntries.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListNodeEntries.swift
+@@ -696,6 +696,10 @@ func chatListNodeEntriesForView(view: EngineChatList, state: ChatListNodeState,
+         if let peerId = peerId, state.pendingRemovalItemIds.contains(ChatListNodeState.ItemId(peerId: peerId, threadId: threadId)) {
+             continue loop
+         }
++        // Focus Modes: a mode that hides its chats takes them out of the chat list while it is on.
++        if case .chatList = mode, threadId == nil, let peerId, state.isHiddenByFocusMode(peerId: peerId) {
++            continue loop
++        }
+         var updatedMessages = entry.messages
+         var updatedCombinedReadState = entry.readCounters
+         if let peerId = peerId, state.pendingClearHistoryPeerIds.contains(ChatListNodeState.ItemId(peerId: peerId, threadId: threadId)) {
+@@ -745,7 +749,7 @@ func chatListNodeEntriesForView(view: EngineChatList, state: ChatListNodeState,
+             presentationData: state.presentationData,
+             messages: updatedMessages,
+             readState: updatedCombinedReadState,
+-            isRemovedFromTotalUnreadCount: entry.isMuted,
++            isRemovedFromTotalUnreadCount: entry.isMuted || state.isSilencedByFocusMode(peerId: entry.renderedPeer.peerId),
+             draftState: draftState,
+             mediaDraftContentType: entry.mediaDraftContentType,
+             peer: entry.renderedPeer,
+@@ -895,7 +899,7 @@ func chatListNodeEntriesForView(view: EngineChatList, state: ChatListNodeState,
+                         presentationData: state.presentationData,
+                         messages: item.item.messages,
+                         readState: item.item.readCounters,
+-                        isRemovedFromTotalUnreadCount: item.item.isMuted,
++                        isRemovedFromTotalUnreadCount: item.item.isMuted || state.isSilencedByFocusMode(peerId: item.item.renderedPeer.peerId),
+                         draftState: draftState,
+                         mediaDraftContentType: item.item.mediaDraftContentType,
+                         peer: item.item.renderedPeer,
+diff --git a/submodules/FocusModes/BUILD b/submodules/FocusModes/BUILD
+new file mode 100644
+index 00000000..58571c75
+--- /dev/null
++++ b/submodules/FocusModes/BUILD
+@@ -0,0 +1,72 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library", "swift_test")
++
++# The rules of Focus Modes and where they are stored. Foundation only: the app, the Notification Service extension and
++# the Focus Filter (App Intents) all read the same files in the app group.
++swift_library(
++    name = "FocusModes",
++    module_name = "FocusModes",
++    srcs = glob([
++        "Sources/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
++
++# The files as a signal, for the app's screens and the chat list.
++swift_library(
++    name = "FocusModesSignals",
++    module_name = "FocusModesSignals",
++    srcs = glob([
++        "Signals/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        ":FocusModes",
++        "//submodules/SSignalKit/SwiftSignalKit:SwiftSignalKit",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
++
++# The Focus Filter that iOS shows in Settings > Focus > (a Focus) > Focus Filters > Telegram. Linked into the app
++# binary and passed to the app's `app_intents`, which extracts its metadata at build time.
++swift_library(
++    name = "FocusFilterIntent",
++    module_name = "FocusFilterIntent",
++    srcs = glob([
++        "Intent/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    linkopts = [
++        "-Wl,-framework,AppIntents",
++    ],
++    deps = [
++        ":FocusModes",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
++
++# Host (macOS) test. Run with `./build-input/bazel-9.2.0-darwin-arm64 test //submodules/FocusModes:FocusModesTests`.
++swift_test(
++    name = "FocusModesTests",
++    srcs = [
++        "Tests/FocusModesTests.swift",
++    ],
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        ":FocusModes",
++    ],
++)
+diff --git a/submodules/FocusModes/Intent/TelegramFocusFilter.swift b/submodules/FocusModes/Intent/TelegramFocusFilter.swift
+new file mode 100644
+index 00000000..7b6a9e1c
+--- /dev/null
++++ b/submodules/FocusModes/Intent/TelegramFocusFilter.swift
+@@ -0,0 +1,123 @@
++import Foundation
++import AppIntents
++import FocusModes
++
++private func focusModesRootPath() -> String? {
++    guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
++        return nil
++    }
++    return FocusModesStore.rootPath(appGroupIdentifier: FocusModesStore.appGroupIdentifier(bundleIdentifier: bundleIdentifier))
++}
++
++@available(iOS 16.0, *)
++private func availableFocusModes() -> [TelegramFocusModeEntity] {
++    guard let rootPath = focusModesRootPath() else {
++        return []
++    }
++    return FocusModesStore.loadSettings(rootPath: rootPath).modes.map(TelegramFocusModeEntity.init(mode:))
++}
++
++/// A Telegram focus mode, as the Focus Filter's picker lists it.
++@available(iOS 16.0, *)
++public struct TelegramFocusModeEntity: AppEntity {
++    public static let typeDisplayRepresentation: TypeDisplayRepresentation = TypeDisplayRepresentation(name: "Telegram Focus Mode")
++    public static let defaultQuery = TelegramFocusModeQuery()
++
++    public var id: String
++    public var title: String
++    public var symbolName: String
++    public var summary: String
++
++    public init(id: String, title: String, symbolName: String, summary: String) {
++        self.id = id
++        self.title = title
++        self.symbolName = symbolName
++        self.summary = summary
++    }
++
++    init(mode: FocusMode) {
++        let summary: String
++        if mode.silencesAllChats {
++            summary = "Silences all chats"
++        } else if mode.silenced.isEmpty && mode.hidden.isEmpty {
++            summary = "No chats silenced yet"
++        } else {
++            func describe(_ targets: FocusChatTargets) -> String {
++                var parts: [String] = []
++                if !targets.folders.isEmpty {
++                    parts.append(targets.folders.map(\.title).joined(separator: ", "))
++                }
++                if !targets.peerIds.isEmpty {
++                    parts.append(targets.peerIds.count == 1 ? "1 chat" : "\(targets.peerIds.count) chats")
++                }
++                return parts.joined(separator: " and ")
++            }
++            var sentences: [String] = []
++            if !mode.hidden.isEmpty {
++                sentences.append("Hides " + describe(mode.hidden))
++            }
++            if !mode.silenced.isEmpty {
++                sentences.append("Silences " + describe(mode.silenced))
++            }
++            summary = sentences.joined(separator: ". ")
++        }
++        self.init(id: "\(mode.id)", title: mode.title, symbolName: mode.symbol.systemImageName, summary: summary)
++    }
++
++    public var displayRepresentation: DisplayRepresentation {
++        return DisplayRepresentation(
++            title: "\(self.title)",
++            subtitle: "\(self.summary)",
++            image: DisplayRepresentation.Image(systemName: self.symbolName)
++        )
++    }
++}
++
++@available(iOS 16.0, *)
++public struct TelegramFocusModeQuery: EntityQuery {
++    public init() {
++    }
++
++    public func entities(for identifiers: [String]) async throws -> [TelegramFocusModeEntity] {
++        return availableFocusModes().filter { identifiers.contains($0.id) }
++    }
++
++    public func suggestedEntities() async throws -> [TelegramFocusModeEntity] {
++        return availableFocusModes()
++    }
++}
++
++/// Settings > Focus > (a Focus) > Focus Filters > Telegram. iOS runs `perform()` when that Focus turns on, with the
++/// chosen mode, and again when it turns off, with the parameter at its default (no mode).
++@available(iOS 16.0, *)
++public struct TelegramFocusFilter: SetFocusFilterIntent {
++    public static let title: LocalizedStringResource = "Set Telegram Focus Mode"
++    public static let description: IntentDescription? = IntentDescription("Silence the chats and folders of a Telegram focus mode while this Focus is on. Chats in Always Notify still reach you.")
++
++    @Parameter(title: "Mode")
++    public var mode: TelegramFocusModeEntity?
++
++    public init() {
++    }
++
++    public var displayRepresentation: DisplayRepresentation {
++        if let mode = self.mode {
++            return DisplayRepresentation(
++                title: "\(mode.title)",
++                subtitle: "\(mode.summary)",
++                image: DisplayRepresentation.Image(systemName: mode.symbolName)
++            )
++        } else {
++            return DisplayRepresentation(title: "Choose a Telegram focus mode")
++        }
++    }
++
++    public func perform() async throws -> some IntentResult {
++        guard let rootPath = focusModesRootPath() else {
++            return .result()
++        }
++        let modeId = self.mode.flatMap { Int32($0.id) }
++        FocusModesStore.saveSystemState(FocusSystemState(modeId: modeId, updatedAt: Date().timeIntervalSince1970), rootPath: rootPath)
++        return .result()
++    }
++}
+diff --git a/submodules/FocusModes/Signals/FocusModesSignals.swift b/submodules/FocusModes/Signals/FocusModesSignals.swift
+new file mode 100644
+index 00000000..aeca2b91
+--- /dev/null
++++ b/submodules/FocusModes/Signals/FocusModesSignals.swift
+@@ -0,0 +1,123 @@
++import Foundation
++import SwiftSignalKit
++import FocusModes
++
++/// The Focus Modes files and what they mean right now.
++public struct FocusModesState: Equatable {
++    public var settings: FocusModesSettings
++    public var systemState: FocusSystemState
++    public var activeMode: FocusActiveMode?
++
++    public init(settings: FocusModesSettings, systemState: FocusSystemState, activeMode: FocusActiveMode?) {
++        self.settings = settings
++        self.systemState = systemState
++        self.activeMode = activeMode
++    }
++
++    public func isSilenced(peerId: Int64) -> Bool {
++        guard let activeMode = self.activeMode else {
++            return false
++        }
++        if self.settings.alwaysNotify.contains(peerId: peerId) {
++            return false
++        }
++        return activeMode.mode.silences(peerId: peerId)
++    }
++
++    public func isHiddenInChatList(peerId: Int64) -> Bool {
++        guard let activeMode = self.activeMode else {
++            return false
++        }
++        return self.settings.isHiddenInChatList(peerId: peerId, activeMode: activeMode.mode)
++    }
++
++    public func hiddenFolderIds(accountPeerId: Int64) -> Set<Int32> {
++        return self.settings.hiddenFolderIds(accountPeerId: accountPeerId, activeMode: self.activeMode?.mode)
++    }
++}
++
++private func currentFocusModesState(rootPath: String) -> FocusModesState {
++    let settings = FocusModesStore.loadSettings(rootPath: rootPath)
++    let systemState = FocusModesStore.loadSystemState(rootPath: rootPath)
++    return FocusModesState(settings: settings, systemState: systemState, activeMode: settings.activeMode(systemState: systemState, at: Date()))
++}
++
++private final class FocusModesDarwinObserver {
++    private let action: () -> Void
++
++    init(action: @escaping () -> Void) {
++        self.action = action
++        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque(), { _, observer, _, _, _ in
++            guard let observer else {
++                return
++            }
++            Unmanaged<FocusModesDarwinObserver>.fromOpaque(observer).takeUnretainedValue().action()
++        }, FocusModesStore.didChangeNotificationName as CFString, nil, .deliverImmediately)
++    }
++
++    deinit {
++        CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), Unmanaged.passUnretained(self).toOpaque(), CFNotificationName(FocusModesStore.didChangeNotificationName as CFString), nil)
++    }
++}
++
++/// The current state, again after every write to the files (from this process or another one of the app group) and
++/// again when a schedule or a timed manual activation changes the active mode.
++public func focusModesState(rootPath: String) -> Signal<FocusModesState, NoError> {
++    return Signal { subscriber in
++        let queue = Queue.mainQueue()
++        let timer = Atomic<SwiftSignalKit.Timer?>(value: nil)
++
++        var update: (() -> Void)?
++        update = {
++            let state = currentFocusModesState(rootPath: rootPath)
++            subscriber.putNext(state)
++
++            let now = Date()
++            var delay = 60.0
++            if let next = state.settings.nextTransitionDate(after: now) {
++                delay = max(1.0, min(delay, next.timeIntervalSince(now) + 0.5))
++            }
++            let updatedTimer = SwiftSignalKit.Timer(timeout: delay, repeat: false, completion: {
++                update?()
++            }, queue: queue)
++            timer.swap(updatedTimer)?.invalidate()
++            updatedTimer.start()
++        }
++
++        let observer = NotificationCenter.default.addObserver(forName: Notification.Name(FocusModesStore.didChangeNotificationName), object: nil, queue: nil, using: { _ in
++            queue.async {
++                update?()
++            }
++        })
++        let darwinObserver = FocusModesDarwinObserver(action: {
++            queue.async {
++                update?()
++            }
++        })
++
++        queue.async {
++            update?()
++        }
++
++        return ActionDisposable {
++            NotificationCenter.default.removeObserver(observer)
++            let _ = darwinObserver
++            queue.async {
++                update = nil
++                timer.swap(nil)?.invalidate()
++            }
++        }
++    }
++    |> distinctUntilChanged
++}
++
++/// Change the settings and notify every subscriber.
++public func updateFocusModesSettings(rootPath: String, _ f: @escaping (FocusModesSettings) -> FocusModesSettings) -> Signal<FocusModesSettings, NoError> {
++    return Signal { subscriber in
++        let result = FocusModesStore.updateSettings(rootPath: rootPath, f)
++        subscriber.putNext(result)
++        subscriber.putCompletion()
++        return EmptyDisposable
++    }
++    |> runOn(Queue.concurrentDefaultQueue())
++}
+diff --git a/submodules/FocusModes/Sources/FocusModesEvaluation.swift b/submodules/FocusModes/Sources/FocusModesEvaluation.swift
+new file mode 100644
+index 00000000..a5225960
+--- /dev/null
++++ b/submodules/FocusModes/Sources/FocusModesEvaluation.swift
+@@ -0,0 +1,123 @@
++import Foundation
++
++public enum FocusActivationSource: Equatable {
++    /// Turned on in Telegram. `until` is a unix time, nil means until it is turned off.
++    case manual(until: Int32?)
++    /// Turned on by an iOS Focus that has the Telegram Focus Filter.
++    case systemFocus
++    /// Turned on by one of the mode's schedules.
++    case schedule
++}
++
++public struct FocusActiveMode: Equatable {
++    public var mode: FocusMode
++    public var source: FocusActivationSource
++
++    public init(mode: FocusMode, source: FocusActivationSource) {
++        self.mode = mode
++        self.source = source
++    }
++}
++
++public enum FocusNotificationDecision: Equatable {
++    /// Nothing to change: the chat's own notification settings apply.
++    case regular
++    /// The active mode silences this chat: the notification is delivered quietly, without sound or banner.
++    case silenced(modeId: Int32)
++    /// The chat is in Always Notify: delivered as Time Sensitive so it passes through an iOS Focus too.
++    case alwaysNotify
++}
++
++public extension FocusModesSettings {
++    /// The mode in effect at `date`. A mode turned on by hand wins, then the one the iOS Focus picked, then the first
++    /// mode whose schedule covers `date`.
++    func activeMode(systemState: FocusSystemState, at date: Date, calendar: Calendar = .current) -> FocusActiveMode? {
++        let timestamp = Int32(date.timeIntervalSince1970)
++        if let manualActivation = self.manualActivation, let mode = self.mode(id: manualActivation.modeId) {
++            if let until = manualActivation.until {
++                if timestamp < until {
++                    return FocusActiveMode(mode: mode, source: .manual(until: until))
++                }
++            } else {
++                return FocusActiveMode(mode: mode, source: .manual(until: nil))
++            }
++        }
++        if let modeId = systemState.modeId, let mode = self.mode(id: modeId) {
++            return FocusActiveMode(mode: mode, source: .systemFocus)
++        }
++        for mode in self.modes {
++            if mode.schedules.contains(where: { $0.contains(date, calendar: calendar) }) {
++                return FocusActiveMode(mode: mode, source: .schedule)
++            }
++        }
++        return nil
++    }
++
++    func notificationDecision(peerId: Int64, systemState: FocusSystemState, at date: Date, calendar: Calendar = .current) -> FocusNotificationDecision {
++        if self.alwaysNotify.contains(peerId: peerId) {
++            return .alwaysNotify
++        }
++        guard let activeMode = self.activeMode(systemState: systemState, at: date, calendar: calendar) else {
++            return .regular
++        }
++        if activeMode.mode.silences(peerId: peerId) {
++            return .silenced(modeId: activeMode.mode.id)
++        }
++        return .regular
++    }
++
++    /// Whether the active mode hides `peerId` from the chat list. Chats in Always Notify stay visible.
++    func isHiddenInChatList(peerId: Int64, systemState: FocusSystemState, at date: Date, calendar: Calendar = .current) -> Bool {
++        guard let activeMode = self.activeMode(systemState: systemState, at: date, calendar: calendar) else {
++            return false
++        }
++        return self.isHiddenInChatList(peerId: peerId, activeMode: activeMode.mode)
++    }
++
++    func isHiddenInChatList(peerId: Int64, activeMode: FocusMode) -> Bool {
++        if self.alwaysNotify.contains(peerId: peerId) {
++            return false
++        }
++        return activeMode.hidden.contains(peerId: peerId)
++    }
++
++    /// The folders of `accountPeerId` whose tabs the active mode hides.
++    func hiddenFolderIds(accountPeerId: Int64, activeMode: FocusMode?) -> Set<Int32> {
++        guard let activeMode else {
++            return Set()
++        }
++        return Set(activeMode.hidden.folders.filter { $0.accountPeerId == accountPeerId }.map(\.id))
++    }
++
++    /// Whether the chat list should show `peerId` as muted right now.
++    func isSilenced(peerId: Int64, systemState: FocusSystemState, at date: Date, calendar: Calendar = .current) -> Bool {
++        if case .silenced = self.notificationDecision(peerId: peerId, systemState: systemState, at: date, calendar: calendar) {
++            return true
++        }
++        return false
++    }
++
++    /// The next moment the answer of `activeMode` can change because of a schedule or a timed manual activation, so a
++    /// screen showing it knows when to look again. Checked minute by minute over the coming week.
++    func nextTransitionDate(after date: Date, calendar: Calendar = .current) -> Date? {
++        var candidates: [Date] = []
++        if let until = self.manualActivation?.until, Double(until) > date.timeIntervalSince1970 {
++            candidates.append(Date(timeIntervalSince1970: Double(until)))
++        }
++        let hasSchedules = self.modes.contains(where: { !$0.schedules.isEmpty })
++        if hasSchedules {
++            let startOfMinute = calendar.dateInterval(of: .minute, for: date)?.start ?? date
++            let initial = self.modes.map { mode in mode.schedules.contains(where: { $0.contains(date, calendar: calendar) }) }
++            var probe = startOfMinute
++            for _ in 0 ..< (7 * 24 * 60) {
++                probe = probe.addingTimeInterval(60.0)
++                let current = self.modes.map { mode in mode.schedules.contains(where: { $0.contains(probe, calendar: calendar) }) }
++                if current != initial {
++                    candidates.append(probe)
++                    break
++                }
++            }
++        }
++        return candidates.min()
++    }
++}
+diff --git a/submodules/FocusModes/Sources/FocusModesSettings.swift b/submodules/FocusModes/Sources/FocusModesSettings.swift
+new file mode 100644
+index 00000000..a9022d1d
+--- /dev/null
++++ b/submodules/FocusModes/Sources/FocusModesSettings.swift
+@@ -0,0 +1,292 @@
++import Foundation
++
++/// The glyph and tint of a mode, the same set iOS offers for its own Focuses.
++public enum FocusModeSymbol: String, Codable, CaseIterable {
++    case work
++    case personal
++    case sleep
++    case doNotDisturb
++    case fitness
++    case reading
++    case driving
++    case gaming
++    case mindfulness
++
++    /// An SF Symbol name.
++    public var systemImageName: String {
++        switch self {
++        case .work:
++            return "briefcase.fill"
++        case .personal:
++            return "person.fill"
++        case .sleep:
++            return "bed.double.fill"
++        case .doNotDisturb:
++            return "moon.fill"
++        case .fitness:
++            return "figure.run"
++        case .reading:
++            return "book.fill"
++        case .driving:
++            return "car.fill"
++        case .gaming:
++            return "gamecontroller.fill"
++        case .mindfulness:
++            return "brain.head.profile"
++        }
++    }
++
++    public var rgbColor: UInt32 {
++        switch self {
++        case .work:
++            return 0x2fb0c7
++        case .personal:
++            return 0xaf52de
++        case .sleep:
++            return 0x30b6a4
++        case .doNotDisturb:
++            return 0x5e5ce6
++        case .fitness:
++            return 0x34c759
++        case .reading:
++            return 0xff9500
++        case .driving:
++            return 0x0a84ff
++        case .gaming:
++            return 0x007aff
++        case .mindfulness:
++            return 0x00c7be
++        }
++    }
++}
++
++/// A chat folder as a Focus rule sees it. The notification extension cannot evaluate a folder's filters (contacts,
++/// groups, "exclude muted"...), so the app stores the peers the folder held the last time it looked at it.
++public struct FocusChatFolder: Codable, Equatable, Hashable {
++    public var accountPeerId: Int64
++    public var id: Int32
++    public var title: String
++    public var emoticon: String?
++    public var peerIds: [Int64]
++
++    public init(accountPeerId: Int64, id: Int32, title: String, emoticon: String?, peerIds: [Int64]) {
++        self.accountPeerId = accountPeerId
++        self.id = id
++        self.title = title
++        self.emoticon = emoticon
++        self.peerIds = peerIds
++    }
++}
++
++/// Chats and folders a rule applies to.
++public struct FocusChatTargets: Codable, Equatable {
++    public var peerIds: [Int64]
++    public var folders: [FocusChatFolder]
++
++    public init(peerIds: [Int64] = [], folders: [FocusChatFolder] = []) {
++        self.peerIds = peerIds
++        self.folders = folders
++    }
++
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        self.peerIds = try container.decodeIfPresent([Int64].self, forKey: .peerIds) ?? []
++        self.folders = try container.decodeIfPresent([FocusChatFolder].self, forKey: .folders) ?? []
++    }
++
++    public var isEmpty: Bool {
++        return self.peerIds.isEmpty && self.folders.isEmpty
++    }
++
++    public var count: Int {
++        return self.peerIds.count + self.folders.count
++    }
++
++    public func contains(peerId: Int64) -> Bool {
++        if self.peerIds.contains(peerId) {
++            return true
++        }
++        for folder in self.folders {
++            if folder.peerIds.contains(peerId) {
++                return true
++            }
++        }
++        return false
++    }
++
++    public func containsFolder(accountPeerId: Int64, id: Int32) -> Bool {
++        return self.folders.contains(where: { $0.accountPeerId == accountPeerId && $0.id == id })
++    }
++}
++
++/// A time of the week when a mode turns on by itself. `startMinute` and `endMinute` count minutes from midnight; a
++/// range that ends before it starts runs past midnight into the next day (Mon 19:00 – Tue 09:00).
++public struct FocusSchedule: Codable, Equatable {
++    /// `Calendar` weekdays: 1 is Sunday, 7 is Saturday.
++    public var weekdays: [Int]
++    public var isAllDay: Bool
++    public var startMinute: Int32
++    public var endMinute: Int32
++
++    public init(weekdays: [Int], isAllDay: Bool, startMinute: Int32, endMinute: Int32) {
++        self.weekdays = weekdays
++        self.isAllDay = isAllDay
++        self.startMinute = startMinute
++        self.endMinute = endMinute
++    }
++
++    public static let workdays: [Int] = [2, 3, 4, 5, 6]
++    public static let weekend: [Int] = [7, 1]
++
++    public func contains(_ date: Date, calendar: Calendar) -> Bool {
++        let components = calendar.dateComponents([.weekday, .hour, .minute], from: date)
++        guard let weekday = components.weekday, let hour = components.hour, let minute = components.minute else {
++            return false
++        }
++        let previousWeekday = weekday == 1 ? 7 : weekday - 1
++        let currentMinute = Int32(hour * 60 + minute)
++
++        if self.isAllDay || self.startMinute == self.endMinute {
++            return self.weekdays.contains(weekday)
++        }
++        if self.startMinute < self.endMinute {
++            return self.weekdays.contains(weekday) && currentMinute >= self.startMinute && currentMinute < self.endMinute
++        } else {
++            if self.weekdays.contains(weekday) && currentMinute >= self.startMinute {
++                return true
++            }
++            if self.weekdays.contains(previousWeekday) && currentMinute < self.endMinute {
++                return true
++            }
++            return false
++        }
++    }
++}
++
++public struct FocusMode: Codable, Equatable {
++    public var id: Int32
++    public var title: String
++    public var symbol: FocusModeSymbol
++    /// Everything except the chats in "Always Notify" goes quiet.
++    public var silencesAllChats: Bool
++    public var silenced: FocusChatTargets
++    /// Chats and folders that disappear from the chat list while the mode is on (a folder loses its tab). They are
++    /// silenced too.
++    public var hidden: FocusChatTargets
++    public var schedules: [FocusSchedule]
++
++    public init(id: Int32, title: String, symbol: FocusModeSymbol, silencesAllChats: Bool, silenced: FocusChatTargets, hidden: FocusChatTargets = FocusChatTargets(), schedules: [FocusSchedule]) {
++        self.id = id
++        self.title = title
++        self.symbol = symbol
++        self.silencesAllChats = silencesAllChats
++        self.silenced = silenced
++        self.hidden = hidden
++        self.schedules = schedules
++    }
++
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        self.id = try container.decode(Int32.self, forKey: .id)
++        self.title = try container.decode(String.self, forKey: .title)
++        self.symbol = (try? container.decodeIfPresent(FocusModeSymbol.self, forKey: .symbol)) ?? .doNotDisturb
++        self.silencesAllChats = try container.decodeIfPresent(Bool.self, forKey: .silencesAllChats) ?? false
++        self.silenced = try container.decodeIfPresent(FocusChatTargets.self, forKey: .silenced) ?? FocusChatTargets()
++        self.hidden = try container.decodeIfPresent(FocusChatTargets.self, forKey: .hidden) ?? FocusChatTargets()
++        self.schedules = try container.decodeIfPresent([FocusSchedule].self, forKey: .schedules) ?? []
++    }
++
++    public func silences(peerId: Int64) -> Bool {
++        return self.silencesAllChats || self.silenced.contains(peerId: peerId) || self.hidden.contains(peerId: peerId)
++    }
++}
++
++/// A mode turned on by hand from Telegram. `until` is a unix time; nil means until it is turned off.
++public struct FocusManualActivation: Codable, Equatable {
++    public var modeId: Int32
++    public var until: Int32?
++
++    public init(modeId: Int32, until: Int32?) {
++        self.modeId = modeId
++        self.until = until
++    }
++}
++
++public struct FocusModesSettings: Codable, Equatable {
++    public var modes: [FocusMode]
++    /// These chats notify in every mode, and are sent as Time Sensitive so they reach you through an iOS Focus.
++    public var alwaysNotify: FocusChatTargets
++    public var manualActivation: FocusManualActivation?
++    /// Silenced chats show the muted icon in the chat list while their mode is on.
++    public var showSilencedInChatList: Bool
++    public var nextModeId: Int32
++
++    public init(modes: [FocusMode], alwaysNotify: FocusChatTargets, manualActivation: FocusManualActivation?, showSilencedInChatList: Bool, nextModeId: Int32) {
++        self.modes = modes
++        self.alwaysNotify = alwaysNotify
++        self.manualActivation = manualActivation
++        self.showSilencedInChatList = showSilencedInChatList
++        self.nextModeId = nextModeId
++    }
++
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        self.modes = try container.decodeIfPresent([FocusMode].self, forKey: .modes) ?? []
++        self.alwaysNotify = try container.decodeIfPresent(FocusChatTargets.self, forKey: .alwaysNotify) ?? FocusChatTargets()
++        self.manualActivation = try container.decodeIfPresent(FocusManualActivation.self, forKey: .manualActivation)
++        self.showSilencedInChatList = try container.decodeIfPresent(Bool.self, forKey: .showSilencedInChatList) ?? true
++        let maxId = self.modes.map(\.id).max() ?? 0
++        self.nextModeId = max(try container.decodeIfPresent(Int32.self, forKey: .nextModeId) ?? 0, maxId + 1)
++    }
++
++    /// Three empty modes to start from. With no chats in them they change nothing.
++    public static let defaultSettings = FocusModesSettings(
++        modes: [
++            FocusMode(id: 1, title: "Work", symbol: .work, silencesAllChats: false, silenced: FocusChatTargets(), schedules: []),
++            FocusMode(id: 2, title: "Personal", symbol: .personal, silencesAllChats: false, silenced: FocusChatTargets(), schedules: []),
++            FocusMode(id: 3, title: "Sleep", symbol: .sleep, silencesAllChats: true, silenced: FocusChatTargets(), schedules: [])
++        ],
++        alwaysNotify: FocusChatTargets(),
++        manualActivation: nil,
++        showSilencedInChatList: true,
++        nextModeId: 4
++    )
++
++    public func mode(id: Int32) -> FocusMode? {
++        return self.modes.first(where: { $0.id == id })
++    }
++
++    public mutating func updateMode(id: Int32, _ f: (inout FocusMode) -> Void) {
++        if let index = self.modes.firstIndex(where: { $0.id == id }) {
++            f(&self.modes[index])
++        }
++    }
++
++    public mutating func addMode(title: String, symbol: FocusModeSymbol) -> Int32 {
++        let id = self.nextModeId
++        self.nextModeId += 1
++        self.modes.append(FocusMode(id: id, title: title, symbol: symbol, silencesAllChats: false, silenced: FocusChatTargets(), schedules: []))
++        return id
++    }
++
++    public mutating func removeMode(id: Int32) {
++        self.modes.removeAll(where: { $0.id == id })
++        if self.manualActivation?.modeId == id {
++            self.manualActivation = nil
++        }
++    }
++}
++
++/// What the iOS Focus Filter last told Telegram. Written by the filter, separately from the settings, so a Focus that
++/// turns on while the settings screen is open cannot overwrite an edit.
++public struct FocusSystemState: Codable, Equatable {
++    public var modeId: Int32?
++    public var updatedAt: Double
++
++    public init(modeId: Int32?, updatedAt: Double) {
++        self.modeId = modeId
++        self.updatedAt = updatedAt
++    }
++
++    public static let empty = FocusSystemState(modeId: nil, updatedAt: 0.0)
++}
+diff --git a/submodules/FocusModes/Sources/FocusModesStore.swift b/submodules/FocusModes/Sources/FocusModesStore.swift
+new file mode 100644
+index 00000000..746a7de9
+--- /dev/null
++++ b/submodules/FocusModes/Sources/FocusModesStore.swift
+@@ -0,0 +1,99 @@
++import Foundation
++
++/// Reads and writes the Focus Modes files under the app group root (`<group>/telegram-data`), the same directory the
++/// app, the Notification Service extension and the Focus Filter all open. JSON files rather than the account manager
++/// database: the Focus Filter runs in a background launch where opening the database is not worth it, and the
++/// extension reads them with a single file read.
++public enum FocusModesStore {
++    /// Posted in-process after either file is written. A Darwin notification with the same name reaches the other
++    /// processes of the app group.
++    public static let didChangeNotificationName = "org.telegram.Telegram.FocusModesDidChange"
++
++    public static func settingsPath(rootPath: String) -> String {
++        return rootPath + "/focus-modes.json"
++    }
++
++    public static func systemStatePath(rootPath: String) -> String {
++        return rootPath + "/focus-modes-system.json"
++    }
++
++    /// `<group container>/telegram-data` for a process that knows only the app group, as the Focus Filter does.
++    public static func rootPath(appGroupIdentifier: String) -> String? {
++        guard let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
++            return nil
++        }
++        return url.path + "/telegram-data"
++    }
++
++    /// `group.ph.telegra.Telegraph` for the app and for any of its extensions.
++    public static func appGroupIdentifier(bundleIdentifier: String) -> String {
++        var baseBundleId = bundleIdentifier
++        let extensionSuffixes = [".NotificationService", ".NotificationContent", ".Share", ".SiriIntents", ".Widget", ".BroadcastUpload", ".watchkitapp"]
++        for suffix in extensionSuffixes {
++            if baseBundleId.hasSuffix(suffix) {
++                baseBundleId = String(baseBundleId.dropLast(suffix.count))
++                break
++            }
++        }
++        return "group.\(baseBundleId)"
++    }
++
++    public static func loadSettings(rootPath: String) -> FocusModesSettings {
++        guard let data = try? Data(contentsOf: URL(fileURLWithPath: self.settingsPath(rootPath: rootPath))) else {
++            return .defaultSettings
++        }
++        return (try? JSONDecoder().decode(FocusModesSettings.self, from: data)) ?? .defaultSettings
++    }
++
++    public static func loadSystemState(rootPath: String) -> FocusSystemState {
++        guard let data = try? Data(contentsOf: URL(fileURLWithPath: self.systemStatePath(rootPath: rootPath))) else {
++            return .empty
++        }
++        return (try? JSONDecoder().decode(FocusSystemState.self, from: data)) ?? .empty
++    }
++
++    public static func saveSettings(_ settings: FocusModesSettings, rootPath: String) {
++        self.write(settings, path: self.settingsPath(rootPath: rootPath))
++    }
++
++    public static func saveSystemState(_ state: FocusSystemState, rootPath: String) {
++        self.write(state, path: self.systemStatePath(rootPath: rootPath))
++    }
++
++    /// Read, change and write the settings under a lock, so two writers in this process cannot lose each other's
++    /// change. Returns the stored value.
++    @discardableResult
++    public static func updateSettings(rootPath: String, _ f: (FocusModesSettings) -> FocusModesSettings) -> FocusModesSettings {
++        self.lock.lock()
++        defer {
++            self.lock.unlock()
++        }
++        let current = self.loadSettings(rootPath: rootPath)
++        let updated = f(current)
++        if updated != current {
++            self.write(updated, path: self.settingsPath(rootPath: rootPath))
++        }
++        return updated
++    }
++
++    private static let lock = NSLock()
++
++    private static func write<T: Encodable>(_ value: T, path: String) {
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.sortedKeys]
++        guard let data = try? encoder.encode(value) else {
++            return
++        }
++        let directory = (path as NSString).deletingLastPathComponent
++        let _ = try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true, attributes: nil)
++        // Written in place: the extension and the app must be able to read the file while the device is locked
++        // (NSFileProtectionCompleteUntilFirstUserAuthentication, the container default).
++        let _ = try? data.write(to: URL(fileURLWithPath: path), options: [.atomic])
++        self.postDidChange()
++    }
++
++    public static func postDidChange() {
++        NotificationCenter.default.post(name: Notification.Name(self.didChangeNotificationName), object: nil)
++        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFNotificationName(self.didChangeNotificationName as CFString), nil, nil, true)
++    }
++}
+diff --git a/submodules/FocusModes/Tests/FocusModesTests.swift b/submodules/FocusModes/Tests/FocusModesTests.swift
+new file mode 100644
+index 00000000..fa7db011
+--- /dev/null
++++ b/submodules/FocusModes/Tests/FocusModesTests.swift
+@@ -0,0 +1,128 @@
++import Foundation
++import XCTest
++@testable import FocusModes
++
++final class FocusModesTests: XCTestCase {
++    private var calendar: Calendar {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(identifier: "UTC")!
++        return calendar
++    }
++
++    /// 2026-11-09 is a Monday.
++    private func date(day: Int, hour: Int, minute: Int = 0) -> Date {
++        return self.calendar.date(from: DateComponents(year: 2026, month: 11, day: day, hour: hour, minute: minute))!
++    }
++
++    private let familyPeerId: Int64 = 100
++    private let workChatPeerId: Int64 = 200
++    private let colleaguePeerId: Int64 = 201
++    private let friendPeerId: Int64 = 300
++
++    /// Off work: the Work folder is quiet on weekday evenings and all weekend. Sleep silences everything.
++    private var settings: FocusModesSettings {
++        var settings = FocusModesSettings.defaultSettings
++        settings.alwaysNotify = FocusChatTargets(peerIds: [self.familyPeerId])
++        settings.updateMode(id: 2) { mode in
++            mode.title = "Off Work"
++            mode.silenced = FocusChatTargets(peerIds: [], folders: [
++                FocusChatFolder(accountPeerId: 1, id: 7, title: "Work", emoticon: "💼", peerIds: [self.workChatPeerId, self.colleaguePeerId])
++            ])
++            mode.schedules = [
++                FocusSchedule(weekdays: FocusSchedule.workdays, isAllDay: false, startMinute: 19 * 60, endMinute: 9 * 60),
++                FocusSchedule(weekdays: FocusSchedule.weekend, isAllDay: true, startMinute: 0, endMinute: 0)
++            ]
++        }
++        return settings
++    }
++
++    func testWorkFolderIsAudibleDuringWorkHours() {
++        let monday = self.date(day: 9, hour: 11)
++        XCTAssertNil(self.settings.activeMode(systemState: .empty, at: monday, calendar: self.calendar))
++        XCTAssertEqual(self.settings.notificationDecision(peerId: self.workChatPeerId, systemState: .empty, at: monday, calendar: self.calendar), .regular)
++    }
++
++    func testWorkFolderIsSilencedOnWeekdayEvening() {
++        let mondayEvening = self.date(day: 9, hour: 21)
++        XCTAssertEqual(self.settings.activeMode(systemState: .empty, at: mondayEvening, calendar: self.calendar)?.mode.id, 2)
++        XCTAssertEqual(self.settings.notificationDecision(peerId: self.colleaguePeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar), .silenced(modeId: 2))
++        XCTAssertEqual(self.settings.notificationDecision(peerId: self.friendPeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar), .regular)
++    }
++
++    func testOvernightRangeCarriesIntoNextMorning() {
++        // Tuesday 08:30 still belongs to Monday's 19:00 – 09:00.
++        XCTAssertEqual(self.settings.activeMode(systemState: .empty, at: self.date(day: 10, hour: 8, minute: 30), calendar: self.calendar)?.source, .schedule)
++        XCTAssertNil(self.settings.activeMode(systemState: .empty, at: self.date(day: 10, hour: 9), calendar: self.calendar))
++        // Friday evening, then the whole weekend.
++        XCTAssertNotNil(self.settings.activeMode(systemState: .empty, at: self.date(day: 13, hour: 22), calendar: self.calendar))
++        XCTAssertNotNil(self.settings.activeMode(systemState: .empty, at: self.date(day: 14, hour: 2), calendar: self.calendar))
++        XCTAssertNotNil(self.settings.activeMode(systemState: .empty, at: self.date(day: 15, hour: 14), calendar: self.calendar))
++        // Monday 08:00 is the tail of Sunday, which is in the weekend schedule only as an all-day range.
++        XCTAssertNil(self.settings.activeMode(systemState: .empty, at: self.date(day: 16, hour: 8), calendar: self.calendar))
++    }
++
++    func testAlwaysNotifyWinsOverSilenceAll() {
++        let systemState = FocusSystemState(modeId: 3, updatedAt: 0.0)
++        let monday = self.date(day: 9, hour: 11)
++        XCTAssertEqual(self.settings.activeMode(systemState: systemState, at: monday, calendar: self.calendar)?.source, .systemFocus)
++        XCTAssertEqual(self.settings.notificationDecision(peerId: self.familyPeerId, systemState: systemState, at: monday, calendar: self.calendar), .alwaysNotify)
++        XCTAssertEqual(self.settings.notificationDecision(peerId: self.friendPeerId, systemState: systemState, at: monday, calendar: self.calendar), .silenced(modeId: 3))
++    }
++
++    func testManualActivationWinsAndExpires() {
++        var settings = self.settings
++        let monday = self.date(day: 9, hour: 11)
++        settings.manualActivation = FocusManualActivation(modeId: 1, until: Int32(monday.timeIntervalSince1970) + 3600)
++        let systemState = FocusSystemState(modeId: 3, updatedAt: 0.0)
++        XCTAssertEqual(settings.activeMode(systemState: systemState, at: monday, calendar: self.calendar)?.mode.id, 1)
++        XCTAssertEqual(settings.activeMode(systemState: systemState, at: monday.addingTimeInterval(3601), calendar: self.calendar)?.mode.id, 3)
++        XCTAssertEqual(settings.nextTransitionDate(after: monday, calendar: self.calendar), monday.addingTimeInterval(3600))
++    }
++
++    func testNextTransitionFollowsSchedule() {
++        let monday = self.date(day: 9, hour: 11, minute: 15)
++        XCTAssertEqual(self.settings.nextTransitionDate(after: monday, calendar: self.calendar), self.date(day: 9, hour: 19))
++    }
++
++    func testHiddenChatsAndFoldersFollowTheActiveMode() {
++        var settings = self.settings
++        settings.alwaysNotify.peerIds.append(self.colleaguePeerId)
++        settings.updateMode(id: 2) { mode in
++            mode.hidden = mode.silenced
++            mode.silenced = FocusChatTargets(peerIds: [self.friendPeerId])
++        }
++        let mondayEvening = self.date(day: 9, hour: 21)
++        let monday = self.date(day: 9, hour: 11)
++        XCTAssertTrue(settings.isHiddenInChatList(peerId: self.workChatPeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar))
++        // Always Notify keeps a chat visible even inside a hidden folder.
++        XCTAssertFalse(settings.isHiddenInChatList(peerId: self.colleaguePeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar))
++        // Silenced but not hidden: stays in the list, muted.
++        XCTAssertFalse(settings.isHiddenInChatList(peerId: self.friendPeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar))
++        XCTAssertEqual(settings.notificationDecision(peerId: self.friendPeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar), .silenced(modeId: 2))
++        // Hidden chats are silenced too.
++        XCTAssertEqual(settings.notificationDecision(peerId: self.workChatPeerId, systemState: .empty, at: mondayEvening, calendar: self.calendar), .silenced(modeId: 2))
++        XCTAssertFalse(settings.isHiddenInChatList(peerId: self.workChatPeerId, systemState: .empty, at: monday, calendar: self.calendar))
++
++        let active = settings.activeMode(systemState: .empty, at: mondayEvening, calendar: self.calendar)?.mode
++        XCTAssertEqual(settings.hiddenFolderIds(accountPeerId: 1, activeMode: active), [7])
++        XCTAssertEqual(settings.hiddenFolderIds(accountPeerId: 2, activeMode: active), [])
++        XCTAssertEqual(self.settings.hiddenFolderIds(accountPeerId: 1, activeMode: self.settings.mode(id: 2)), [])
++    }
++
++    func testDecodesOlderFilesAndRoundTrips() throws {
++        let legacy = #"{"modes":[{"id":5,"title":"Gym"}]}"#.data(using: .utf8)!
++        let decoded = try JSONDecoder().decode(FocusModesSettings.self, from: legacy)
++        XCTAssertEqual(decoded.modes.first?.symbol, .doNotDisturb)
++        XCTAssertEqual(decoded.nextModeId, 6)
++        XCTAssertTrue(decoded.showSilencedInChatList)
++        XCTAssertEqual(decoded.modes.first?.hidden, FocusChatTargets())
++
++        let data = try JSONEncoder().encode(self.settings)
++        XCTAssertEqual(try JSONDecoder().decode(FocusModesSettings.self, from: data), self.settings)
++    }
++
++    func testStoreUsesTheAppGroupOfTheMainApp() {
++        XCTAssertEqual(FocusModesStore.appGroupIdentifier(bundleIdentifier: "ph.telegra.Telegraph"), "group.ph.telegra.Telegraph")
++        XCTAssertEqual(FocusModesStore.appGroupIdentifier(bundleIdentifier: "ph.telegra.Telegraph.NotificationService"), "group.ph.telegra.Telegraph")
++    }
++}
+diff --git a/submodules/SettingsUI/BUILD b/submodules/SettingsUI/BUILD
+index 40742e6e..39d8cfd7 100644
+--- a/submodules/SettingsUI/BUILD
++++ b/submodules/SettingsUI/BUILD
+@@ -26,6 +26,8 @@ swift_library(
+         "//submodules/CallListUI:CallListUI",
+         "//submodules/ChatListSearchItemHeader:ChatListSearchItemHeader",
+         "//submodules/ChatListUI:ChatListUI",
++        "//submodules/FocusModes:FocusModes",
++        "//submodules/FocusModes:FocusModesSignals",
+         "//submodules/ContactsPeerItem:ContactsPeerItem",
+         "//submodules/CountrySelectionUI:CountrySelectionUI",
+         "//submodules/DeviceAccess:DeviceAccess",
+diff --git a/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModeEditController.swift b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModeEditController.swift
+new file mode 100644
+index 00000000..59c0bc22
+--- /dev/null
++++ b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModeEditController.swift
+@@ -0,0 +1,740 @@
++import Foundation
++import UIKit
++import Display
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import ItemListUI
++import PresentationDataUtils
++import AccountContext
++import ItemListPeerItem
++import ItemListPeerActionItem
++import ChatListUI
++import FocusModes
++import FocusModesSignals
++
++private final class FocusModeEditControllerArguments {
++    let context: AccountContext
++    let updateTitle: (String) -> Void
++    let updateSymbol: (FocusModeSymbol) -> Void
++    let updateSilenceAll: (Bool) -> Void
++    let addTargets: () -> Void
++    let removePeer: (EnginePeer.Id) -> Void
++    let removeFolder: (FocusChatFolder) -> Void
++    let addHiddenTargets: () -> Void
++    let removeHiddenPeer: (EnginePeer.Id) -> Void
++    let removeHiddenFolder: (FocusChatFolder) -> Void
++    let setRevealedItem: (FocusModesEntryId?, FocusModesEntryId?) -> Void
++    let openSchedule: (Int) -> Void
++    let addSchedule: () -> Void
++    let turnOn: () -> Void
++    let deleteMode: () -> Void
++
++    init(context: AccountContext, updateTitle: @escaping (String) -> Void, updateSymbol: @escaping (FocusModeSymbol) -> Void, updateSilenceAll: @escaping (Bool) -> Void, addTargets: @escaping () -> Void, removePeer: @escaping (EnginePeer.Id) -> Void, removeFolder: @escaping (FocusChatFolder) -> Void, addHiddenTargets: @escaping () -> Void, removeHiddenPeer: @escaping (EnginePeer.Id) -> Void, removeHiddenFolder: @escaping (FocusChatFolder) -> Void, setRevealedItem: @escaping (FocusModesEntryId?, FocusModesEntryId?) -> Void, openSchedule: @escaping (Int) -> Void, addSchedule: @escaping () -> Void, turnOn: @escaping () -> Void, deleteMode: @escaping () -> Void) {
++        self.context = context
++        self.updateTitle = updateTitle
++        self.updateSymbol = updateSymbol
++        self.updateSilenceAll = updateSilenceAll
++        self.addTargets = addTargets
++        self.removePeer = removePeer
++        self.removeFolder = removeFolder
++        self.addHiddenTargets = addHiddenTargets
++        self.removeHiddenPeer = removeHiddenPeer
++        self.removeHiddenFolder = removeHiddenFolder
++        self.setRevealedItem = setRevealedItem
++        self.openSchedule = openSchedule
++        self.addSchedule = addSchedule
++        self.turnOn = turnOn
++        self.deleteMode = deleteMode
++    }
++}
++
++private enum FocusModeEditSection: Int32 {
++    case name
++    case symbol
++    case silence
++    case hide
++    case schedule
++    case actions
++}
++
++private enum FocusModeEditEntry: ItemListNodeEntry {
++    case nameHeader(String)
++    case name(text: String, placeholder: String)
++    case symbolHeader(String)
++    case symbol(FocusModeSymbol)
++    case silenceHeader(String)
++    case silenceAll(String, Bool)
++    case addTargets(String)
++    case folder(index: Int, folder: FocusChatFolder, isRevealed: Bool)
++    case peer(index: Int, peer: EnginePeer, isRevealed: Bool)
++    case silenceInfo(String)
++    case hideHeader(String)
++    case addHidden(String)
++    case hiddenFolder(index: Int, folder: FocusChatFolder, isRevealed: Bool)
++    case hiddenPeer(index: Int, peer: EnginePeer, isRevealed: Bool)
++    case hideInfo(String)
++    case scheduleHeader(String)
++    case schedule(index: Int, days: String, time: String)
++    case addSchedule(String)
++    case scheduleInfo(String)
++    case turnOn(String)
++    case delete(String)
++
++    var section: ItemListSectionId {
++        switch self {
++        case .nameHeader, .name:
++            return FocusModeEditSection.name.rawValue
++        case .symbolHeader, .symbol:
++            return FocusModeEditSection.symbol.rawValue
++        case .silenceHeader, .silenceAll, .addTargets, .folder, .peer, .silenceInfo:
++            return FocusModeEditSection.silence.rawValue
++        case .hideHeader, .addHidden, .hiddenFolder, .hiddenPeer, .hideInfo:
++            return FocusModeEditSection.hide.rawValue
++        case .scheduleHeader, .schedule, .addSchedule, .scheduleInfo:
++            return FocusModeEditSection.schedule.rawValue
++        case .turnOn, .delete:
++            return FocusModeEditSection.actions.rawValue
++        }
++    }
++
++    var stableId: FocusModesEntryId {
++        switch self {
++        case .nameHeader:
++            return .index(0)
++        case .name:
++            return .index(1)
++        case .symbolHeader:
++            return .index(2)
++        case .symbol:
++            return .index(3)
++        case .silenceHeader:
++            return .index(4)
++        case .silenceAll:
++            return .index(5)
++        case .addTargets:
++            return .index(6)
++        case let .folder(_, folder, _):
++            return .folder(folder.accountPeerId, folder.id)
++        case let .peer(_, peer, _):
++            return .peer(peer.id)
++        case .silenceInfo:
++            return .index(7)
++        case .scheduleHeader:
++            return .index(8)
++        case let .schedule(index, _, _):
++            return .index(1000 + index)
++        case .addSchedule:
++            return .index(9)
++        case .scheduleInfo:
++            return .index(10)
++        case .turnOn:
++            return .index(11)
++        case .delete:
++            return .index(12)
++        case .hideHeader:
++            return .index(13)
++        case .addHidden:
++            return .index(14)
++        case let .hiddenFolder(_, folder, _):
++            return .hiddenFolder(folder.accountPeerId, folder.id)
++        case let .hiddenPeer(_, peer, _):
++            return .hiddenPeer(peer.id)
++        case .hideInfo:
++            return .index(15)
++        }
++    }
++
++    private var sortIndex: Int {
++        switch self {
++        case .nameHeader:
++            return 0
++        case .name:
++            return 1
++        case .symbolHeader:
++            return 2
++        case .symbol:
++            return 3
++        case .silenceHeader:
++            return 10
++        case .silenceAll:
++            return 11
++        case .addTargets:
++            return 12
++        case let .folder(index, _, _):
++            return 100 + index
++        case let .peer(index, _, _):
++            return 1000 + index
++        case .silenceInfo:
++            return 5000
++        case .hideHeader:
++            return 5010
++        case .addHidden:
++            return 5011
++        case let .hiddenFolder(index, _, _):
++            return 5020 + index
++        case let .hiddenPeer(index, _, _):
++            return 5050 + index
++        case .hideInfo:
++            return 5099
++        case .scheduleHeader:
++            return 5100
++        case let .schedule(index, _, _):
++            return 5101 + index
++        case .addSchedule:
++            return 5900
++        case .scheduleInfo:
++            return 5901
++        case .turnOn:
++            return 6000
++        case .delete:
++            return 6001
++        }
++    }
++
++    static func <(lhs: FocusModeEditEntry, rhs: FocusModeEditEntry) -> Bool {
++        return lhs.sortIndex < rhs.sortIndex
++    }
++
++    func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
++        let arguments = arguments as! FocusModeEditControllerArguments
++        switch self {
++        case let .nameHeader(text), let .symbolHeader(text), let .silenceHeader(text), let .hideHeader(text), let .scheduleHeader(text):
++            return ItemListSectionHeaderItem(presentationData: presentationData, text: text, sectionId: self.section)
++        case let .name(text, placeholder):
++            return ItemListSingleLineInputItem(presentationData: presentationData, systemStyle: .glass, title: NSAttributedString(), text: text, placeholder: placeholder, maxLength: 24, sectionId: self.section, textUpdated: { value in
++                arguments.updateTitle(value)
++            }, action: {})
++        case let .symbol(symbol):
++            return FocusModeSymbolPickerItem(presentationData: presentationData, systemStyle: .glass, selectedSymbol: symbol, sectionId: self.section, selected: { symbol in
++                arguments.updateSymbol(symbol)
++            })
++        case let .silenceAll(text, value):
++            return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
++                arguments.updateSilenceAll(value)
++            })
++        case let .addHidden(text):
++            return ItemListPeerActionItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesItemList.plusIconImage(presentationData.theme), title: text, alwaysPlain: false, sectionId: self.section, height: .peerList, editing: false, action: {
++                arguments.addHiddenTargets()
++            })
++        case let .hiddenFolder(_, folder, isRevealed):
++            let id = FocusModesEntryId.hiddenFolder(folder.accountPeerId, folder.id)
++            return ChatListFilterPresetCategoryItem(presentationData: presentationData, systemStyle: .glass, title: folder.title, icon: .folder, isRevealed: isRevealed, sectionId: self.section, updatedRevealedOptions: { reveal in
++                if reveal {
++                    arguments.setRevealedItem(id, nil)
++                } else {
++                    arguments.setRevealedItem(nil, id)
++                }
++            }, remove: {
++                arguments.removeHiddenFolder(folder)
++            })
++        case let .hiddenPeer(_, peer, isRevealed):
++            return ItemListPeerItem(presentationData: presentationData, systemStyle: .glass, dateTimeFormat: PresentationDateTimeFormat(), nameDisplayOrder: .firstLast, context: arguments.context, peer: peer, height: .peerList, aliasHandling: .threatSelfAsSaved, presence: nil, text: .none, label: .none, editing: ItemListPeerItemEditing(editable: true, editing: false, revealed: isRevealed), revealOptions: ItemListPeerItemRevealOptions(options: [ItemListPeerItemRevealOption(type: .destructive, title: presentationData.strings.Common_Delete, action: {
++                arguments.removeHiddenPeer(peer.id)
++            })]), switchValue: nil, enabled: true, selectable: false, sectionId: self.section, action: nil, setPeerIdWithRevealedOptions: { lhs, rhs in
++                arguments.setRevealedItem(lhs.flatMap { .hiddenPeer($0) }, rhs.flatMap { .hiddenPeer($0) })
++            }, removePeer: { id in
++                arguments.removeHiddenPeer(id)
++            })
++        case let .addTargets(text):
++            return ItemListPeerActionItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesItemList.plusIconImage(presentationData.theme), title: text, alwaysPlain: false, sectionId: self.section, height: .peerList, editing: false, action: {
++                arguments.addTargets()
++            })
++        case let .folder(_, folder, isRevealed):
++            let id = FocusModesEntryId.folder(folder.accountPeerId, folder.id)
++            return ChatListFilterPresetCategoryItem(presentationData: presentationData, systemStyle: .glass, title: folder.title, icon: .folder, isRevealed: isRevealed, sectionId: self.section, updatedRevealedOptions: { reveal in
++                if reveal {
++                    arguments.setRevealedItem(id, nil)
++                } else {
++                    arguments.setRevealedItem(nil, id)
++                }
++            }, remove: {
++                arguments.removeFolder(folder)
++            })
++        case let .peer(_, peer, isRevealed):
++            return ItemListPeerItem(presentationData: presentationData, systemStyle: .glass, dateTimeFormat: PresentationDateTimeFormat(), nameDisplayOrder: .firstLast, context: arguments.context, peer: peer, height: .peerList, aliasHandling: .threatSelfAsSaved, presence: nil, text: .none, label: .none, editing: ItemListPeerItemEditing(editable: true, editing: false, revealed: isRevealed), revealOptions: ItemListPeerItemRevealOptions(options: [ItemListPeerItemRevealOption(type: .destructive, title: presentationData.strings.Common_Delete, action: {
++                arguments.removePeer(peer.id)
++            })]), switchValue: nil, enabled: true, selectable: false, sectionId: self.section, action: nil, setPeerIdWithRevealedOptions: { lhs, rhs in
++                arguments.setRevealedItem(lhs.flatMap { .peer($0) }, rhs.flatMap { .peer($0) })
++            }, removePeer: { id in
++                arguments.removePeer(id)
++            })
++        case let .silenceInfo(text), let .hideInfo(text), let .scheduleInfo(text):
++            return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
++        case let .schedule(index, days, time):
++            return ItemListDisclosureItem(presentationData: presentationData, systemStyle: .glass, title: days, label: time, sectionId: self.section, style: .blocks, action: {
++                arguments.openSchedule(index)
++            })
++        case let .addSchedule(text):
++            return ItemListPeerActionItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesItemList.plusIconImage(presentationData.theme), title: text, alwaysPlain: false, sectionId: self.section, height: .generic, editing: false, action: {
++                arguments.addSchedule()
++            })
++        case let .turnOn(text):
++            return ItemListActionItem(presentationData: presentationData, systemStyle: .glass, title: text, kind: .generic, alignment: .natural, sectionId: self.section, style: .blocks, action: {
++                arguments.turnOn()
++            })
++        case let .delete(text):
++            return ItemListActionItem(presentationData: presentationData, systemStyle: .glass, title: text, kind: .destructive, alignment: .natural, sectionId: self.section, style: .blocks, action: {
++                arguments.deleteMode()
++            })
++        }
++    }
++}
++
++private struct FocusModeEditControllerState: Equatable {
++    var revealedItem: FocusModesEntryId?
++}
++
++private func focusModeEditEntries(presentationData: PresentationData, mode: FocusMode, isActive: Bool, controllerState: FocusModeEditControllerState, peers: [EnginePeer.Id: EnginePeer]) -> [FocusModeEditEntry] {
++    let strings = presentationData.strings
++    var entries: [FocusModeEditEntry] = []
++
++    entries.append(.nameHeader(strings.FocusModes_NameHeader.uppercased()))
++    entries.append(.name(text: mode.title, placeholder: strings.FocusModes_NamePlaceholder))
++    entries.append(.symbolHeader(strings.FocusModes_IconHeader.uppercased()))
++    entries.append(.symbol(mode.symbol))
++
++    entries.append(.silenceHeader(strings.FocusModes_SilenceHeader.uppercased()))
++    entries.append(.silenceAll(strings.FocusModes_SilenceAll, mode.silencesAllChats))
++    if mode.silencesAllChats {
++        entries.append(.silenceInfo(strings.FocusModes_SilenceAllInfo))
++    } else {
++        entries.append(.addTargets(strings.FocusModes_AddChatsOrFolders))
++        for (index, folder) in mode.silenced.folders.enumerated() {
++            entries.append(.folder(index: index, folder: folder, isRevealed: controllerState.revealedItem == .folder(folder.accountPeerId, folder.id)))
++        }
++        var peerIndex = 0
++        for peerId in mode.silenced.peerIds {
++            if let peer = peers[EnginePeer.Id(peerId)] {
++                entries.append(.peer(index: peerIndex, peer: peer, isRevealed: controllerState.revealedItem == .peer(peer.id)))
++                peerIndex += 1
++            }
++        }
++        entries.append(.silenceInfo(strings.FocusModes_SilenceInfo))
++    }
++
++    entries.append(.hideHeader(strings.FocusModes_HideHeader.uppercased()))
++    entries.append(.addHidden(strings.FocusModes_AddChatsOrFolders))
++    for (index, folder) in mode.hidden.folders.enumerated() {
++        entries.append(.hiddenFolder(index: index, folder: folder, isRevealed: controllerState.revealedItem == .hiddenFolder(folder.accountPeerId, folder.id)))
++    }
++    var hiddenPeerIndex = 0
++    for peerId in mode.hidden.peerIds {
++        if let peer = peers[EnginePeer.Id(peerId)] {
++            entries.append(.hiddenPeer(index: hiddenPeerIndex, peer: peer, isRevealed: controllerState.revealedItem == .hiddenPeer(peer.id)))
++            hiddenPeerIndex += 1
++        }
++    }
++    entries.append(.hideInfo(strings.FocusModes_HideInfo))
++
++    entries.append(.scheduleHeader(strings.FocusModes_ScheduleHeader.uppercased()))
++    for (index, schedule) in mode.schedules.enumerated() {
++        let (days, time) = focusScheduleString(schedule, presentationData: presentationData)
++        entries.append(.schedule(index: index, days: days, time: time))
++    }
++    entries.append(.addSchedule(strings.FocusModes_AddSchedule))
++    entries.append(.scheduleInfo(strings.FocusModes_ScheduleInfo))
++
++    if !isActive {
++        entries.append(.turnOn(strings.FocusModes_TurnOnNow))
++    }
++    entries.append(.delete(strings.FocusModes_DeleteMode))
++
++    return entries
++}
++
++func focusModeEditController(context: AccountContext, modeId: Int32, isNew: Bool = false) -> ViewController {
++    let rootPath = context.sharedContext.basePath
++
++    let statePromise = ValuePromise(FocusModeEditControllerState(), ignoreRepeated: true)
++    let stateValue = Atomic(value: FocusModeEditControllerState())
++    let updateState: ((FocusModeEditControllerState) -> FocusModeEditControllerState) -> Void = { f in
++        statePromise.set(stateValue.modify { f($0) })
++    }
++
++    var presentControllerImpl: ((ViewController) -> Void)?
++    var pushControllerImpl: ((ViewController) -> Void)?
++    var dismissImpl: (() -> Void)?
++
++    let focusState = Promise<FocusModesState>()
++    focusState.set(focusModesState(rootPath: rootPath))
++
++    let updateMode: (@escaping (inout FocusMode) -> Void) -> Void = { f in
++        let _ = updateFocusModesSettings(rootPath: rootPath, { settings in
++            var settings = settings
++            settings.updateMode(id: modeId, f)
++            return settings
++        }).start()
++    }
++
++    let openSchedule: (Int) -> Void = { index in
++        pushControllerImpl?(focusScheduleController(context: context, modeId: modeId, scheduleIndex: index))
++    }
++
++    let arguments = FocusModeEditControllerArguments(context: context, updateTitle: { title in
++        updateMode { mode in
++            mode.title = title
++        }
++    }, updateSymbol: { symbol in
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        updateMode { mode in
++            // A new mode takes the name of its first icon, until it is named.
++            if mode.title == presentationData.strings.FocusModes_NewMode || FocusModeSymbol.allCases.contains(where: { focusModeSymbolTitle($0, strings: presentationData.strings) == mode.title }) {
++                mode.title = focusModeSymbolTitle(symbol, strings: presentationData.strings)
++            }
++            mode.symbol = symbol
++        }
++    }, updateSilenceAll: { value in
++        updateMode { mode in
++            mode.silencesAllChats = value
++        }
++    }, addTargets: {
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        let _ = (focusState.get()
++        |> take(1)
++        |> deliverOnMainQueue).start(next: { state in
++            guard let mode = state.settings.mode(id: modeId) else {
++                return
++            }
++            presentFocusTargetsPicker(context: context, title: presentationData.strings.FocusModes_SilenceTitle, current: mode.silenced, push: { c in
++                pushControllerImpl?(c)
++            }, completion: { targets in
++                updateMode { mode in
++                    mode.silenced = targets
++                }
++            })
++        })
++    }, removePeer: { peerId in
++        updateMode { mode in
++            mode.silenced.peerIds.removeAll(where: { $0 == peerId.toInt64() })
++        }
++    }, removeFolder: { folder in
++        updateMode { mode in
++            mode.silenced.folders.removeAll(where: { $0.accountPeerId == folder.accountPeerId && $0.id == folder.id })
++        }
++    }, addHiddenTargets: {
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        let _ = (focusState.get()
++        |> take(1)
++        |> deliverOnMainQueue).start(next: { state in
++            guard let mode = state.settings.mode(id: modeId) else {
++                return
++            }
++            presentFocusTargetsPicker(context: context, title: presentationData.strings.FocusModes_HideTitle, current: mode.hidden, push: { c in
++                pushControllerImpl?(c)
++            }, completion: { targets in
++                updateMode { mode in
++                    mode.hidden = targets
++                }
++            })
++        })
++    }, removeHiddenPeer: { peerId in
++        updateMode { mode in
++            mode.hidden.peerIds.removeAll(where: { $0 == peerId.toInt64() })
++        }
++    }, removeHiddenFolder: { folder in
++        updateMode { mode in
++            mode.hidden.folders.removeAll(where: { $0.accountPeerId == folder.accountPeerId && $0.id == folder.id })
++        }
++    }, setRevealedItem: { id, fromId in
++        updateState { state in
++            var state = state
++            if (id == nil && fromId == state.revealedItem) || (id != nil && fromId == nil) {
++                state.revealedItem = id
++            }
++            return state
++        }
++    }, openSchedule: { index in
++        openSchedule(index)
++    }, addSchedule: {
++        let _ = (updateFocusModesSettings(rootPath: rootPath, { settings in
++            var settings = settings
++            settings.updateMode(id: modeId) { mode in
++                mode.schedules.append(FocusSchedule(weekdays: FocusSchedule.workdays, isAllDay: false, startMinute: 19 * 60, endMinute: 9 * 60))
++            }
++            return settings
++        })
++        |> deliverOnMainQueue).start(next: { settings in
++            if let mode = settings.mode(id: modeId) {
++                openSchedule(mode.schedules.count - 1)
++            }
++        })
++    }, turnOn: {
++        let _ = (focusState.get()
++        |> take(1)
++        |> deliverOnMainQueue).start(next: { state in
++            var settings = state.settings
++            settings.modes = settings.modes.filter { $0.id == modeId }
++            presentFocusModeTurnOnSheet(context: context, settings: settings, present: { c in
++                presentControllerImpl?(c)
++            })
++        })
++    }, deleteMode: {
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        let actionSheet = ActionSheetController(presentationData: presentationData)
++        actionSheet.setItemGroups([
++            ActionSheetItemGroup(items: [
++                ActionSheetTextItem(title: presentationData.strings.FocusModes_DeleteModeConfirmation),
++                ActionSheetButtonItem(title: presentationData.strings.FocusModes_DeleteMode, color: .destructive, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    let _ = updateFocusModesSettings(rootPath: rootPath, { settings in
++                        var settings = settings
++                        settings.removeMode(id: modeId)
++                        return settings
++                    }).start()
++                    dismissImpl?()
++                })
++            ]),
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                })
++            ])
++        ])
++        presentControllerImpl?(actionSheet)
++    })
++
++    let modeSignal = focusState.get()
++    |> map { state -> (FocusMode?, Bool) in
++        return (state.settings.mode(id: modeId), state.activeMode?.mode.id == modeId)
++    }
++
++    let peers = modeSignal
++    |> map { mode, _ -> [EnginePeer.Id] in
++        return ((mode?.silenced.peerIds ?? []) + (mode?.hidden.peerIds ?? [])).map { EnginePeer.Id($0) }
++    }
++    |> distinctUntilChanged
++    |> mapToSignal { peerIds -> Signal<[EnginePeer.Id: EnginePeer], NoError> in
++        return context.engine.data.subscribe(EngineDataMap(peerIds.map(TelegramEngine.EngineData.Item.Peer.Peer.init(id:))))
++        |> map { peers -> [EnginePeer.Id: EnginePeer] in
++            var result: [EnginePeer.Id: EnginePeer] = [:]
++            for (id, peer) in peers {
++                if let peer {
++                    result[id] = peer
++                }
++            }
++            return result
++        }
++    }
++
++    let signal = combineLatest(queue: .mainQueue(), context.sharedContext.presentationData, modeSignal, statePromise.get(), peers)
++    |> map { presentationData, modeAndActive, controllerState, peers -> (ItemListControllerState, (ItemListNodeState, Any)) in
++        let (mode, isActive) = modeAndActive
++        let title = mode?.title.isEmpty == false ? mode!.title : presentationData.strings.FocusModes_NewMode
++        let controllerStateValue = ItemListControllerState(presentationData: ItemListPresentationData(presentationData), title: .text(title), leftNavigationButton: nil, rightNavigationButton: nil, backNavigationButton: ItemListBackButton(title: presentationData.strings.Common_Back), animateChanges: false)
++        let entries: [FocusModeEditEntry] = mode.flatMap { focusModeEditEntries(presentationData: presentationData, mode: $0, isActive: isActive, controllerState: controllerState, peers: peers) } ?? []
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: entries, style: .blocks, animateChanges: true)
++        return (controllerStateValue, (listState, arguments))
++    }
++
++    let controller = ItemListController(context: context, state: signal)
++    presentControllerImpl = { [weak controller] c in
++        controller?.present(c, in: .window(.root))
++    }
++    pushControllerImpl = { [weak controller] c in
++        (controller?.navigationController as? NavigationController)?.pushViewController(c)
++    }
++    dismissImpl = { [weak controller] in
++        let _ = controller?.navigationController?.popViewController(animated: true)
++    }
++    return controller
++}
++
++// MARK: - Schedule
++
++private enum FocusScheduleSection: Int32 {
++    case days
++    case time
++    case actions
++}
++
++private enum FocusScheduleEntry: ItemListNodeEntry {
++    case daysHeader(String)
++    case day(index: Int, weekday: Int, title: String, isSelected: Bool)
++    case timeHeader(String)
++    case allDay(String, Bool)
++    case from(String, Int32)
++    case to(String, Int32)
++    case timeInfo(String)
++    case delete(String)
++
++    var section: ItemListSectionId {
++        switch self {
++        case .daysHeader, .day:
++            return FocusScheduleSection.days.rawValue
++        case .timeHeader, .allDay, .from, .to, .timeInfo:
++            return FocusScheduleSection.time.rawValue
++        case .delete:
++            return FocusScheduleSection.actions.rawValue
++        }
++    }
++
++    var stableId: Int {
++        switch self {
++        case .daysHeader:
++            return 0
++        case let .day(index, _, _, _):
++            return 1 + index
++        case .timeHeader:
++            return 20
++        case .allDay:
++            return 21
++        case .from:
++            return 22
++        case .to:
++            return 23
++        case .timeInfo:
++            return 24
++        case .delete:
++            return 30
++        }
++    }
++
++    static func <(lhs: FocusScheduleEntry, rhs: FocusScheduleEntry) -> Bool {
++        return lhs.stableId < rhs.stableId
++    }
++
++    func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
++        let arguments = arguments as! FocusScheduleControllerArguments
++        switch self {
++        case let .daysHeader(text), let .timeHeader(text):
++            return ItemListSectionHeaderItem(presentationData: presentationData, text: text, sectionId: self.section)
++        case let .day(_, weekday, title, isSelected):
++            return ItemListCheckboxItem(presentationData: presentationData, systemStyle: .glass, title: title, style: .right, checked: isSelected, zeroSeparatorInsets: false, sectionId: self.section, action: {
++                arguments.toggleWeekday(weekday)
++            })
++        case let .allDay(text, value):
++            return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
++                arguments.updateAllDay(value)
++            })
++        case let .from(text, minute):
++            return FocusTimeItem(presentationData: presentationData, systemStyle: .glass, title: text, minute: minute, sectionId: self.section, updated: { minute in
++                arguments.updateStart(minute)
++            })
++        case let .to(text, minute):
++            return FocusTimeItem(presentationData: presentationData, systemStyle: .glass, title: text, minute: minute, sectionId: self.section, updated: { minute in
++                arguments.updateEnd(minute)
++            })
++        case let .timeInfo(text):
++            return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
++        case let .delete(text):
++            return ItemListActionItem(presentationData: presentationData, systemStyle: .glass, title: text, kind: .destructive, alignment: .natural, sectionId: self.section, style: .blocks, action: {
++                arguments.delete()
++            })
++        }
++    }
++}
++
++private final class FocusScheduleControllerArguments {
++    let toggleWeekday: (Int) -> Void
++    let updateAllDay: (Bool) -> Void
++    let updateStart: (Int32) -> Void
++    let updateEnd: (Int32) -> Void
++    let delete: () -> Void
++
++    init(toggleWeekday: @escaping (Int) -> Void, updateAllDay: @escaping (Bool) -> Void, updateStart: @escaping (Int32) -> Void, updateEnd: @escaping (Int32) -> Void, delete: @escaping () -> Void) {
++        self.toggleWeekday = toggleWeekday
++        self.updateAllDay = updateAllDay
++        self.updateStart = updateStart
++        self.updateEnd = updateEnd
++        self.delete = delete
++    }
++}
++
++private func focusScheduleEntries(presentationData: PresentationData, schedule: FocusSchedule) -> [FocusScheduleEntry] {
++    let strings = presentationData.strings
++    var entries: [FocusScheduleEntry] = []
++
++    entries.append(.daysHeader(strings.FocusModes_DaysHeader.uppercased()))
++    let formatter = DateFormatter()
++    formatter.locale = Locale(identifier: strings.baseLanguageCode)
++    let symbols = formatter.weekdaySymbols ?? ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
++    for (index, weekday) in [2, 3, 4, 5, 6, 7, 1].enumerated() {
++        entries.append(.day(index: index, weekday: weekday, title: symbols[weekday - 1].capitalized, isSelected: schedule.weekdays.contains(weekday)))
++    }
++
++    entries.append(.timeHeader(strings.FocusModes_TimeHeader.uppercased()))
++    entries.append(.allDay(strings.FocusModes_AllDay, schedule.isAllDay))
++    if !schedule.isAllDay {
++        entries.append(.from(strings.FocusModes_From, schedule.startMinute))
++        entries.append(.to(strings.FocusModes_To, schedule.endMinute))
++        if schedule.endMinute < schedule.startMinute {
++            entries.append(.timeInfo(strings.FocusModes_ScheduleNextDayInfo(focusTimeString(minute: schedule.endMinute, dateTimeFormat: presentationData.dateTimeFormat)).string))
++        }
++    }
++    entries.append(.delete(strings.FocusModes_DeleteSchedule))
++    return entries
++}
++
++private func focusScheduleController(context: AccountContext, modeId: Int32, scheduleIndex: Int) -> ViewController {
++    let rootPath = context.sharedContext.basePath
++    var dismissImpl: (() -> Void)?
++
++    let updateSchedule: (@escaping (inout FocusSchedule) -> Void) -> Void = { f in
++        let _ = updateFocusModesSettings(rootPath: rootPath, { settings in
++            var settings = settings
++            settings.updateMode(id: modeId) { mode in
++                if scheduleIndex < mode.schedules.count {
++                    f(&mode.schedules[scheduleIndex])
++                }
++            }
++            return settings
++        }).start()
++    }
++
++    let arguments = FocusScheduleControllerArguments(toggleWeekday: { weekday in
++        updateSchedule { schedule in
++            if let index = schedule.weekdays.firstIndex(of: weekday) {
++                schedule.weekdays.remove(at: index)
++            } else {
++                schedule.weekdays.append(weekday)
++            }
++        }
++    }, updateAllDay: { value in
++        updateSchedule { schedule in
++            schedule.isAllDay = value
++        }
++    }, updateStart: { minute in
++        updateSchedule { schedule in
++            schedule.startMinute = minute
++        }
++    }, updateEnd: { minute in
++        updateSchedule { schedule in
++            schedule.endMinute = minute
++        }
++    }, delete: {
++        let _ = updateFocusModesSettings(rootPath: rootPath, { settings in
++            var settings = settings
++            settings.updateMode(id: modeId) { mode in
++                if scheduleIndex < mode.schedules.count {
++                    mode.schedules.remove(at: scheduleIndex)
++                }
++            }
++            return settings
++        }).start()
++        dismissImpl?()
++    })
++
++    let scheduleSignal = focusModesState(rootPath: rootPath)
++    |> map { state -> FocusSchedule? in
++        guard let mode = state.settings.mode(id: modeId), scheduleIndex < mode.schedules.count else {
++            return nil
++        }
++        return mode.schedules[scheduleIndex]
++    }
++    |> distinctUntilChanged
++
++    let signal = combineLatest(queue: .mainQueue(), context.sharedContext.presentationData, scheduleSignal)
++    |> map { presentationData, schedule -> (ItemListControllerState, (ItemListNodeState, Any)) in
++        let controllerState = ItemListControllerState(presentationData: ItemListPresentationData(presentationData), title: .text(presentationData.strings.FocusModes_ScheduleTitle), leftNavigationButton: nil, rightNavigationButton: nil, backNavigationButton: ItemListBackButton(title: presentationData.strings.Common_Back))
++        let entries = schedule.flatMap { focusScheduleEntries(presentationData: presentationData, schedule: $0) } ?? []
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: entries, style: .blocks, animateChanges: true)
++        return (controllerState, (listState, arguments))
++    }
++
++    let controller = ItemListController(context: context, state: signal)
++    dismissImpl = { [weak controller] in
++        let _ = controller?.navigationController?.popViewController(animated: true)
++    }
++    return controller
++}
+diff --git a/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModeSymbolPickerItem.swift b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModeSymbolPickerItem.swift
+new file mode 100644
+index 00000000..5294cd6e
+--- /dev/null
++++ b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModeSymbolPickerItem.swift
+@@ -0,0 +1,223 @@
++import Foundation
++import UIKit
++import Display
++import AsyncDisplayKit
++import SwiftSignalKit
++import TelegramPresentationData
++import ItemListUI
++import FocusModes
++
++/// The glyphs a mode can have, as a grid of round icons with the chosen one ringed.
++final class FocusModeSymbolPickerItem: ListViewItem, ItemListItem {
++    let presentationData: ItemListPresentationData
++    let systemStyle: ItemListSystemStyle
++    let selectedSymbol: FocusModeSymbol
++    let sectionId: ItemListSectionId
++    let selected: (FocusModeSymbol) -> Void
++
++    init(presentationData: ItemListPresentationData, systemStyle: ItemListSystemStyle, selectedSymbol: FocusModeSymbol, sectionId: ItemListSectionId, selected: @escaping (FocusModeSymbol) -> Void) {
++        self.presentationData = presentationData
++        self.systemStyle = systemStyle
++        self.selectedSymbol = selectedSymbol
++        self.sectionId = sectionId
++        self.selected = selected
++    }
++
++    func nodeConfiguredForParams(async: @escaping (@escaping () -> Void) -> Void, params: ListViewItemLayoutParams, synchronousLoads: Bool, neighbors: ListViewItemNeighbors, completion: @escaping (ListViewItemNode, @escaping () -> (Signal<Void, NoError>?, (ListViewItemApply) -> Void)) -> Void) {
++        async {
++            let node = FocusModeSymbolPickerItemNode()
++            let (layout, apply) = node.asyncLayout()(self, params, itemListNeighbors(item: self, topFacet: neighbors.previous?.base(ItemListNeighborFacet.self), bottomFacet: neighbors.next?.base(ItemListNeighborFacet.self)))
++            node.contentSize = layout.contentSize
++            node.insets = layout.insets
++            Queue.mainQueue().async {
++                completion(node, {
++                    return (nil, { _ in apply(.None) })
++                })
++            }
++        }
++    }
++
++    func updateNode(async: @escaping (@escaping () -> Void) -> Void, node: @escaping () -> ListViewItemNode, params: ListViewItemLayoutParams, neighbors: ListViewItemNeighbors, animation: ListViewItemUpdateAnimation, completion: @escaping (ListViewItemNodeLayout, @escaping (ListViewItemApply) -> Void) -> Void) {
++        Queue.mainQueue().async {
++            if let nodeValue = node() as? FocusModeSymbolPickerItemNode {
++                let makeLayout = nodeValue.asyncLayout()
++                async {
++                    let (layout, apply) = makeLayout(self, params, itemListNeighbors(item: self, topFacet: neighbors.previous?.base(ItemListNeighborFacet.self), bottomFacet: neighbors.next?.base(ItemListNeighborFacet.self)))
++                    Queue.mainQueue().async {
++                        completion(layout, { _ in
++                            apply(animation)
++                        })
++                    }
++                }
++            }
++        }
++    }
++
++    var selectable: Bool {
++        return false
++    }
++}
++
++private let iconSize: CGFloat = 46.0
++private let ringInset: CGFloat = 4.0
++
++private func ringImage(color: UIColor) -> UIImage? {
++    let size = CGSize(width: iconSize + ringInset * 2.0, height: iconSize + ringInset * 2.0)
++    return generateImage(size, rotatedContext: { size, context in
++        context.clear(CGRect(origin: CGPoint(), size: size))
++        context.setStrokeColor(color.cgColor)
++        context.setLineWidth(2.5)
++        context.strokeEllipse(in: CGRect(origin: CGPoint(), size: size).insetBy(dx: 1.25, dy: 1.25))
++    })
++}
++
++final class FocusModeSymbolPickerItemNode: ListViewItemNode, ItemListItemNode {
++    private let backgroundNode: ASDisplayNode
++    private let topStripeNode: ASDisplayNode
++    private let bottomStripeNode: ASDisplayNode
++    private let maskNode: ASImageNode
++
++    private var buttonNodes: [FocusModeSymbol: HighlightableButtonNode] = [:]
++    private let ringNode: ASImageNode
++
++    private var item: FocusModeSymbolPickerItem?
++
++    var tag: ItemListItemTag? {
++        return nil
++    }
++
++    override var canBeSelected: Bool {
++        return false
++    }
++
++    init() {
++        self.backgroundNode = ASDisplayNode()
++        self.backgroundNode.isLayerBacked = true
++        self.topStripeNode = ASDisplayNode()
++        self.topStripeNode.isLayerBacked = true
++        self.bottomStripeNode = ASDisplayNode()
++        self.bottomStripeNode.isLayerBacked = true
++        self.maskNode = ASImageNode()
++        self.maskNode.isUserInteractionEnabled = false
++        self.ringNode = ASImageNode()
++        self.ringNode.isUserInteractionEnabled = false
++        self.ringNode.displaysAsynchronously = false
++
++        super.init(layerBacked: false)
++
++        for symbol in FocusModeSymbol.allCases {
++            let buttonNode = HighlightableButtonNode()
++            buttonNode.setImage(focusModeIcon(symbol, size: iconSize, cornerRadius: iconSize / 2.0), for: .normal)
++            buttonNode.addTarget(self, action: #selector(self.buttonPressed(_:)), forControlEvents: .touchUpInside)
++            buttonNode.accessibilityLabel = symbol.rawValue
++            self.buttonNodes[symbol] = buttonNode
++            self.addSubnode(buttonNode)
++        }
++        self.addSubnode(self.ringNode)
++    }
++
++    @objc private func buttonPressed(_ sender: ASButtonNode) {
++        for (symbol, node) in self.buttonNodes where node === sender {
++            self.item?.selected(symbol)
++        }
++    }
++
++    func asyncLayout() -> (_ item: FocusModeSymbolPickerItem, _ params: ListViewItemLayoutParams, _ neighbors: ItemListNeighbors) -> (ListViewItemNodeLayout, (ListViewItemUpdateAnimation) -> Void) {
++        let currentItem = self.item
++
++        return { [weak self] item, params, neighbors in
++            let themeUpdated = currentItem?.presentationData.theme !== item.presentationData.theme
++
++            let symbols = FocusModeSymbol.allCases
++            let perRow = 5
++            let rows = Int(ceil(Double(symbols.count) / Double(perRow)))
++            let verticalInset: CGFloat = 18.0
++            let rowSpacing: CGFloat = 14.0
++            let height = verticalInset * 2.0 + CGFloat(rows) * iconSize + CGFloat(rows - 1) * rowSpacing
++            let contentSize = CGSize(width: params.width, height: height)
++            let insets = itemListNeighborsGroupedInsets(neighbors, params)
++            let separatorHeight = UIScreenPixel
++
++            return (ListViewItemNodeLayout(contentSize: contentSize, insets: insets), { [weak self] animation in
++                guard let self else {
++                    return
++                }
++                self.item = item
++                let transition = animation.transition
++
++                if themeUpdated {
++                    self.backgroundNode.backgroundColor = item.presentationData.theme.list.itemBlocksBackgroundColor
++                    self.topStripeNode.backgroundColor = item.presentationData.theme.list.itemBlocksSeparatorColor
++                    self.bottomStripeNode.backgroundColor = item.presentationData.theme.list.itemBlocksSeparatorColor
++                    self.ringNode.image = ringImage(color: item.presentationData.theme.list.itemAccentColor)
++                }
++
++                if self.backgroundNode.supernode == nil {
++                    self.insertSubnode(self.backgroundNode, at: 0)
++                }
++                if self.topStripeNode.supernode == nil {
++                    self.insertSubnode(self.topStripeNode, at: 1)
++                }
++                if self.bottomStripeNode.supernode == nil {
++                    self.insertSubnode(self.bottomStripeNode, at: 2)
++                }
++                if self.maskNode.supernode == nil {
++                    self.addSubnode(self.maskNode)
++                }
++
++                let hasCorners = itemListHasRoundedBlockLayout(params)
++                var hasTopCorners = false
++                var hasBottomCorners = false
++                switch neighbors.top {
++                case .sameSection(false):
++                    self.topStripeNode.isHidden = true
++                default:
++                    hasTopCorners = true
++                    self.topStripeNode.isHidden = hasCorners
++                }
++                let bottomStripeInset: CGFloat
++                switch neighbors.bottom {
++                case .sameSection(false):
++                    bottomStripeInset = params.leftInset + 16.0
++                    self.bottomStripeNode.isHidden = false
++                default:
++                    bottomStripeInset = 0.0
++                    hasBottomCorners = true
++                    self.bottomStripeNode.isHidden = hasCorners
++                }
++                self.maskNode.image = hasCorners ? PresentationResourcesItemList.cornersImage(item.presentationData.theme, top: hasTopCorners, bottom: hasBottomCorners, glass: item.systemStyle == .glass) : nil
++
++                self.backgroundNode.frame = CGRect(origin: CGPoint(x: 0.0, y: -min(insets.top, separatorHeight)), size: CGSize(width: params.width, height: contentSize.height + min(insets.top, separatorHeight) + min(insets.bottom, separatorHeight)))
++                self.maskNode.frame = self.backgroundNode.frame.inset(by: UIEdgeInsets(top: 0.0, left: params.leftInset, bottom: 0.0, right: params.rightInset))
++                self.topStripeNode.frame = CGRect(origin: CGPoint(x: 0.0, y: -min(insets.top, separatorHeight)), size: CGSize(width: params.width, height: separatorHeight))
++                self.bottomStripeNode.frame = CGRect(origin: CGPoint(x: bottomStripeInset, y: contentSize.height - separatorHeight), size: CGSize(width: params.width - bottomStripeInset, height: separatorHeight))
++
++                let availableWidth = params.width - params.leftInset - params.rightInset - 32.0
++                let spacing = floor((availableWidth - CGFloat(perRow) * iconSize) / CGFloat(perRow - 1))
++                for (index, symbol) in symbols.enumerated() {
++                    guard let buttonNode = self.buttonNodes[symbol] else {
++                        continue
++                    }
++                    let row = index / perRow
++                    let column = index % perRow
++                    let itemsInRow = min(perRow, symbols.count - row * perRow)
++                    let rowWidth = CGFloat(itemsInRow) * iconSize + CGFloat(itemsInRow - 1) * spacing
++                    let rowOrigin = params.leftInset + floor((params.width - params.leftInset - params.rightInset - rowWidth) / 2.0)
++                    let frame = CGRect(origin: CGPoint(x: rowOrigin + CGFloat(column) * (iconSize + spacing), y: verticalInset + CGFloat(row) * (iconSize + rowSpacing)), size: CGSize(width: iconSize, height: iconSize))
++                    buttonNode.frame = frame
++                    if symbol == item.selectedSymbol {
++                        transition.updateFrame(node: self.ringNode, frame: frame.insetBy(dx: -ringInset, dy: -ringInset))
++                    }
++                }
++            })
++        }
++    }
++
++    override func animateInsertion(_ currentTimestamp: Double, duration: Double, options: ListViewItemAnimationOptions) {
++        self.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.4)
++    }
++
++    override func animateRemoved(_ currentTimestamp: Double, duration: Double) {
++        self.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.15, removeOnCompletion: false)
++    }
++}
+diff --git a/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModesController.swift b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModesController.swift
+new file mode 100644
+index 00000000..203063bd
+--- /dev/null
++++ b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModesController.swift
+@@ -0,0 +1,475 @@
++import Foundation
++import UIKit
++import Display
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import ItemListUI
++import PresentationDataUtils
++import AccountContext
++import ItemListPeerItem
++import ItemListPeerActionItem
++import ChatListUI
++import FocusModes
++import FocusModesSignals
++
++private final class FocusModesControllerArguments {
++    let context: AccountContext
++    let turnOn: () -> Void
++    let turnOff: () -> Void
++    let openMode: (Int32) -> Void
++    let addMode: () -> Void
++    let addAlwaysNotify: () -> Void
++    let removeAlwaysNotifyPeer: (EnginePeer.Id) -> Void
++    let removeAlwaysNotifyFolder: (FocusChatFolder) -> Void
++    let setRevealedItem: (FocusModesEntryId?, FocusModesEntryId?) -> Void
++    let updateShowMuted: (Bool) -> Void
++
++    init(context: AccountContext, turnOn: @escaping () -> Void, turnOff: @escaping () -> Void, openMode: @escaping (Int32) -> Void, addMode: @escaping () -> Void, addAlwaysNotify: @escaping () -> Void, removeAlwaysNotifyPeer: @escaping (EnginePeer.Id) -> Void, removeAlwaysNotifyFolder: @escaping (FocusChatFolder) -> Void, setRevealedItem: @escaping (FocusModesEntryId?, FocusModesEntryId?) -> Void, updateShowMuted: @escaping (Bool) -> Void) {
++        self.context = context
++        self.turnOn = turnOn
++        self.turnOff = turnOff
++        self.openMode = openMode
++        self.addMode = addMode
++        self.addAlwaysNotify = addAlwaysNotify
++        self.removeAlwaysNotifyPeer = removeAlwaysNotifyPeer
++        self.removeAlwaysNotifyFolder = removeAlwaysNotifyFolder
++        self.setRevealedItem = setRevealedItem
++        self.updateShowMuted = updateShowMuted
++    }
++}
++
++private enum FocusModesSection: Int32 {
++    case active
++    case modes
++    case alwaysNotify
++    case display
++}
++
++enum FocusModesEntryId: Hashable {
++    case index(Int)
++    case mode(Int32)
++    case peer(EnginePeer.Id)
++    case folder(Int64, Int32)
++    case hiddenPeer(EnginePeer.Id)
++    case hiddenFolder(Int64, Int32)
++}
++
++private enum FocusModesEntry: ItemListNodeEntry {
++    case activeHeader(String)
++    case activeMode(symbol: FocusModeSymbol?, title: String, label: String)
++    case activeAction(String, isTurnOff: Bool)
++    case activeInfo(String)
++
++    case modesHeader(String)
++    case mode(index: Int, mode: FocusMode, summary: String, label: String)
++    case addMode(String)
++    case modesInfo(String)
++
++    case alwaysNotifyHeader(String)
++    case addAlwaysNotify(String)
++    case alwaysNotifyFolder(index: Int, folder: FocusChatFolder, isRevealed: Bool)
++    case alwaysNotifyPeer(index: Int, peer: EnginePeer, isRevealed: Bool)
++    case alwaysNotifyInfo(String)
++
++    case showMuted(String, Bool)
++    case showMutedInfo(String)
++
++    var section: ItemListSectionId {
++        switch self {
++        case .activeHeader, .activeMode, .activeAction, .activeInfo:
++            return FocusModesSection.active.rawValue
++        case .modesHeader, .mode, .addMode, .modesInfo:
++            return FocusModesSection.modes.rawValue
++        case .alwaysNotifyHeader, .addAlwaysNotify, .alwaysNotifyFolder, .alwaysNotifyPeer, .alwaysNotifyInfo:
++            return FocusModesSection.alwaysNotify.rawValue
++        case .showMuted, .showMutedInfo:
++            return FocusModesSection.display.rawValue
++        }
++    }
++
++    var stableId: FocusModesEntryId {
++        switch self {
++        case .activeHeader:
++            return .index(0)
++        case .activeMode:
++            return .index(1)
++        case .activeAction:
++            return .index(2)
++        case .activeInfo:
++            return .index(3)
++        case .modesHeader:
++            return .index(4)
++        case let .mode(_, mode, _, _):
++            return .mode(mode.id)
++        case .addMode:
++            return .index(5)
++        case .modesInfo:
++            return .index(6)
++        case .alwaysNotifyHeader:
++            return .index(7)
++        case .addAlwaysNotify:
++            return .index(8)
++        case let .alwaysNotifyFolder(_, folder, _):
++            return .folder(folder.accountPeerId, folder.id)
++        case let .alwaysNotifyPeer(_, peer, _):
++            return .peer(peer.id)
++        case .alwaysNotifyInfo:
++            return .index(9)
++        case .showMuted:
++            return .index(10)
++        case .showMutedInfo:
++            return .index(11)
++        }
++    }
++
++    private var sortIndex: Int {
++        switch self {
++        case .activeHeader:
++            return 0
++        case .activeMode:
++            return 1
++        case .activeAction:
++            return 2
++        case .activeInfo:
++            return 3
++        case .modesHeader:
++            return 100
++        case let .mode(index, _, _, _):
++            return 101 + index
++        case .addMode:
++            return 500
++        case .modesInfo:
++            return 501
++        case .alwaysNotifyHeader:
++            return 600
++        case .addAlwaysNotify:
++            return 601
++        case let .alwaysNotifyFolder(index, _, _):
++            return 700 + index
++        case let .alwaysNotifyPeer(index, _, _):
++            return 2000 + index
++        case .alwaysNotifyInfo:
++            return 9000
++        case .showMuted:
++            return 9100
++        case .showMutedInfo:
++            return 9101
++        }
++    }
++
++    static func <(lhs: FocusModesEntry, rhs: FocusModesEntry) -> Bool {
++        return lhs.sortIndex < rhs.sortIndex
++    }
++
++    func item(presentationData: ItemListPresentationData, arguments: Any) -> ListViewItem {
++        let arguments = arguments as! FocusModesControllerArguments
++        switch self {
++        case let .activeHeader(text), let .modesHeader(text), let .alwaysNotifyHeader(text):
++            return ItemListSectionHeaderItem(presentationData: presentationData, text: text, sectionId: self.section)
++        case let .activeMode(symbol, title, label):
++            return ItemListDisclosureItem(presentationData: presentationData, systemStyle: .glass, icon: symbol.flatMap { focusModeIcon($0) } ?? focusModeIcon(.doNotDisturb), title: title, titleFont: symbol == nil ? .regular : .bold, label: label, sectionId: self.section, style: .blocks, disclosureStyle: .none, action: nil)
++        case let .activeAction(text, isTurnOff):
++            return ItemListActionItem(presentationData: presentationData, systemStyle: .glass, title: text, kind: isTurnOff ? .destructive : .generic, alignment: .natural, sectionId: self.section, style: .blocks, action: {
++                if isTurnOff {
++                    arguments.turnOff()
++                } else {
++                    arguments.turnOn()
++                }
++            })
++        case let .activeInfo(text), let .modesInfo(text), let .alwaysNotifyInfo(text), let .showMutedInfo(text):
++            return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
++        case let .mode(_, mode, summary, label):
++            return NotificationsCategoryItemListItem(presentationData: presentationData, systemStyle: .glass, icon: focusModeIcon(mode.symbol), title: mode.title, subtitle: summary, label: label, sectionId: self.section, style: .blocks, action: {
++                arguments.openMode(mode.id)
++            })
++        case let .addMode(text):
++            return ItemListPeerActionItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesItemList.plusIconImage(presentationData.theme), title: text, alwaysPlain: false, sectionId: self.section, height: .generic, editing: false, action: {
++                arguments.addMode()
++            })
++        case let .addAlwaysNotify(text):
++            return ItemListPeerActionItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesItemList.plusIconImage(presentationData.theme), title: text, alwaysPlain: false, sectionId: self.section, height: .peerList, editing: false, action: {
++                arguments.addAlwaysNotify()
++            })
++        case let .alwaysNotifyFolder(_, folder, isRevealed):
++            let id = FocusModesEntryId.folder(folder.accountPeerId, folder.id)
++            return ChatListFilterPresetCategoryItem(presentationData: presentationData, systemStyle: .glass, title: folder.title, icon: .folder, isRevealed: isRevealed, sectionId: self.section, updatedRevealedOptions: { reveal in
++                if reveal {
++                    arguments.setRevealedItem(id, nil)
++                } else {
++                    arguments.setRevealedItem(nil, id)
++                }
++            }, remove: {
++                arguments.removeAlwaysNotifyFolder(folder)
++            })
++        case let .alwaysNotifyPeer(_, peer, isRevealed):
++            return ItemListPeerItem(presentationData: presentationData, systemStyle: .glass, dateTimeFormat: PresentationDateTimeFormat(), nameDisplayOrder: .firstLast, context: arguments.context, peer: peer, height: .peerList, aliasHandling: .threatSelfAsSaved, presence: nil, text: .none, label: .none, editing: ItemListPeerItemEditing(editable: true, editing: false, revealed: isRevealed), revealOptions: ItemListPeerItemRevealOptions(options: [ItemListPeerItemRevealOption(type: .destructive, title: presentationData.strings.Common_Delete, action: {
++                arguments.removeAlwaysNotifyPeer(peer.id)
++            })]), switchValue: nil, enabled: true, selectable: false, sectionId: self.section, action: nil, setPeerIdWithRevealedOptions: { lhs, rhs in
++                arguments.setRevealedItem(lhs.flatMap { .peer($0) }, rhs.flatMap { .peer($0) })
++            }, removePeer: { id in
++                arguments.removeAlwaysNotifyPeer(id)
++            })
++        case let .showMuted(text, value):
++            return ItemListSwitchItem(presentationData: presentationData, systemStyle: .glass, title: text, value: value, sectionId: self.section, style: .blocks, updated: { value in
++                arguments.updateShowMuted(value)
++            })
++        }
++    }
++}
++
++private struct FocusModesControllerState: Equatable {
++    var revealedItem: FocusModesEntryId?
++}
++
++private func focusModesControllerEntries(presentationData: PresentationData, state: FocusModesState, controllerState: FocusModesControllerState, peers: [EnginePeer.Id: EnginePeer]) -> [FocusModesEntry] {
++    let strings = presentationData.strings
++    var entries: [FocusModesEntry] = []
++
++    entries.append(.activeHeader(strings.FocusModes_ActiveHeader.uppercased()))
++    if let activeMode = state.activeMode {
++        entries.append(.activeMode(symbol: activeMode.mode.symbol, title: activeMode.mode.title, label: focusActivationString(activeMode, presentationData: presentationData)))
++        if case .manual = activeMode.source {
++            entries.append(.activeAction(strings.FocusModes_TurnOff, isTurnOff: true))
++        } else {
++            entries.append(.activeAction(strings.FocusModes_SwitchMode, isTurnOff: false))
++        }
++        entries.append(.activeInfo(strings.FocusModes_ActiveInfoOn(activeMode.mode.title).string))
++    } else {
++        entries.append(.activeMode(symbol: nil, title: strings.FocusModes_NoActiveMode, label: ""))
++        entries.append(.activeAction(strings.FocusModes_TurnOn, isTurnOff: false))
++        entries.append(.activeInfo(strings.FocusModes_ActiveInfoOff))
++    }
++
++    entries.append(.modesHeader(strings.FocusModes_ModesHeader.uppercased()))
++    for (index, mode) in state.settings.modes.enumerated() {
++        let label = state.activeMode?.mode.id == mode.id ? strings.FocusModes_On : ""
++        entries.append(.mode(index: index, mode: mode, summary: focusModeSummary(mode, presentationData: presentationData), label: label))
++    }
++    entries.append(.addMode(strings.FocusModes_AddMode))
++    entries.append(.modesInfo(strings.FocusModes_ModesInfo))
++
++    entries.append(.alwaysNotifyHeader(strings.FocusModes_AlwaysNotifyHeader.uppercased()))
++    entries.append(.addAlwaysNotify(strings.FocusModes_AddChatsOrFolders))
++    for (index, folder) in state.settings.alwaysNotify.folders.enumerated() {
++        entries.append(.alwaysNotifyFolder(index: index, folder: folder, isRevealed: controllerState.revealedItem == .folder(folder.accountPeerId, folder.id)))
++    }
++    var peerIndex = 0
++    for peerId in state.settings.alwaysNotify.peerIds {
++        if let peer = peers[EnginePeer.Id(peerId)] {
++            entries.append(.alwaysNotifyPeer(index: peerIndex, peer: peer, isRevealed: controllerState.revealedItem == .peer(peer.id)))
++            peerIndex += 1
++        }
++    }
++    entries.append(.alwaysNotifyInfo(strings.FocusModes_AlwaysNotifyInfo))
++
++    entries.append(.showMuted(strings.FocusModes_ShowMuted, state.settings.showSilencedInChatList))
++    entries.append(.showMutedInfo(strings.FocusModes_ShowMutedInfo))
++
++    return entries
++}
++
++/// Turn a mode on by hand: pick the mode, then for how long.
++func presentFocusModeTurnOnSheet(context: AccountContext, settings: FocusModesSettings, present: @escaping (ViewController) -> Void) {
++    let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++    let rootPath = context.sharedContext.basePath
++
++    let activate: (Int32, Int32?) -> Void = { modeId, until in
++        let _ = updateFocusModesSettings(rootPath: rootPath, { settings in
++            var settings = settings
++            settings.manualActivation = FocusManualActivation(modeId: modeId, until: until)
++            return settings
++        }).start()
++    }
++
++    let chooseDuration: (FocusMode) -> Void = { mode in
++        let now = Date()
++        let calendar = Calendar.current
++        let hour = calendar.component(.hour, from: now)
++        let oneHour = Int32(now.timeIntervalSince1970) + 60 * 60
++
++        let eveningOrMorningTitle: String
++        let eveningOrMorningDate: Date
++        if hour < 18 {
++            eveningOrMorningTitle = presentationData.strings.FocusModes_UntilThisEvening
++            eveningOrMorningDate = calendar.date(bySettingHour: 19, minute: 0, second: 0, of: now) ?? now
++        } else {
++            eveningOrMorningTitle = presentationData.strings.FocusModes_UntilTomorrowMorning
++            let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) ?? now
++            eveningOrMorningDate = calendar.date(bySettingHour: 8, minute: 0, second: 0, of: tomorrow) ?? now
++        }
++
++        let actionSheet = ActionSheetController(presentationData: presentationData)
++        actionSheet.setItemGroups([
++            ActionSheetItemGroup(items: [
++                ActionSheetTextItem(title: presentationData.strings.FocusModes_TurnOnModeTitle(mode.title).string),
++                ActionSheetButtonItem(title: presentationData.strings.FocusModes_ForOneHour, color: .accent, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    activate(mode.id, oneHour)
++                }),
++                ActionSheetButtonItem(title: eveningOrMorningTitle, color: .accent, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    activate(mode.id, Int32(eveningOrMorningDate.timeIntervalSince1970))
++                }),
++                ActionSheetButtonItem(title: presentationData.strings.FocusModes_UntilTurnedOff, color: .accent, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                    activate(mode.id, nil)
++                })
++            ]),
++            ActionSheetItemGroup(items: [
++                ActionSheetButtonItem(title: presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
++                    actionSheet?.dismissAnimated()
++                })
++            ])
++        ])
++        present(actionSheet)
++    }
++
++    if settings.modes.count == 1, let mode = settings.modes.first {
++        chooseDuration(mode)
++        return
++    }
++
++    let actionSheet = ActionSheetController(presentationData: presentationData)
++    var items: [ActionSheetItem] = [ActionSheetTextItem(title: presentationData.strings.FocusModes_ChooseMode)]
++    for mode in settings.modes {
++        items.append(ActionSheetButtonItem(title: mode.title, color: .accent, action: { [weak actionSheet] in
++            actionSheet?.dismissAnimated()
++            chooseDuration(mode)
++        }))
++    }
++    actionSheet.setItemGroups([
++        ActionSheetItemGroup(items: items),
++        ActionSheetItemGroup(items: [
++            ActionSheetButtonItem(title: presentationData.strings.Common_Cancel, color: .accent, font: .bold, action: { [weak actionSheet] in
++                actionSheet?.dismissAnimated()
++            })
++        ])
++    ])
++    present(actionSheet)
++}
++
++public func focusModesController(context: AccountContext) -> ViewController {
++    let rootPath = context.sharedContext.basePath
++
++    let statePromise = ValuePromise(FocusModesControllerState(), ignoreRepeated: true)
++    let stateValue = Atomic(value: FocusModesControllerState())
++    let updateState: ((FocusModesControllerState) -> FocusModesControllerState) -> Void = { f in
++        statePromise.set(stateValue.modify { f($0) })
++    }
++
++    var presentControllerImpl: ((ViewController) -> Void)?
++    var pushControllerImpl: ((ViewController) -> Void)?
++
++    let focusState = Promise<FocusModesState>()
++    focusState.set(focusModesState(rootPath: rootPath))
++
++    let updateSettings: (@escaping (FocusModesSettings) -> FocusModesSettings) -> Void = { f in
++        let _ = updateFocusModesSettings(rootPath: rootPath, f).start()
++    }
++
++    let arguments = FocusModesControllerArguments(context: context, turnOn: {
++        let _ = (focusState.get()
++        |> take(1)
++        |> deliverOnMainQueue).start(next: { state in
++            presentFocusModeTurnOnSheet(context: context, settings: state.settings, present: { c in
++                presentControllerImpl?(c)
++            })
++        })
++    }, turnOff: {
++        updateSettings { settings in
++            var settings = settings
++            settings.manualActivation = nil
++            return settings
++        }
++    }, openMode: { modeId in
++        pushControllerImpl?(focusModeEditController(context: context, modeId: modeId))
++    }, addMode: {
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        let _ = (updateFocusModesSettings(rootPath: rootPath, { settings in
++            var settings = settings
++            let _ = settings.addMode(title: presentationData.strings.FocusModes_NewMode, symbol: .doNotDisturb)
++            return settings
++        })
++        |> deliverOnMainQueue).start(next: { settings in
++            if let mode = settings.modes.last {
++                pushControllerImpl?(focusModeEditController(context: context, modeId: mode.id, isNew: true))
++            }
++        })
++    }, addAlwaysNotify: {
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        let _ = (focusState.get()
++        |> take(1)
++        |> deliverOnMainQueue).start(next: { state in
++            presentFocusTargetsPicker(context: context, title: presentationData.strings.FocusModes_AlwaysNotifyTitle, current: state.settings.alwaysNotify, push: { c in
++                pushControllerImpl?(c)
++            }, completion: { targets in
++                updateSettings { settings in
++                    var settings = settings
++                    settings.alwaysNotify = targets
++                    return settings
++                }
++            })
++        })
++    }, removeAlwaysNotifyPeer: { peerId in
++        updateSettings { settings in
++            var settings = settings
++            settings.alwaysNotify.peerIds.removeAll(where: { $0 == peerId.toInt64() })
++            return settings
++        }
++    }, removeAlwaysNotifyFolder: { folder in
++        updateSettings { settings in
++            var settings = settings
++            settings.alwaysNotify.folders.removeAll(where: { $0.accountPeerId == folder.accountPeerId && $0.id == folder.id })
++            return settings
++        }
++    }, setRevealedItem: { id, fromId in
++        updateState { state in
++            var state = state
++            if (id == nil && fromId == state.revealedItem) || (id != nil && fromId == nil) {
++                state.revealedItem = id
++            }
++            return state
++        }
++    }, updateShowMuted: { value in
++        updateSettings { settings in
++            var settings = settings
++            settings.showSilencedInChatList = value
++            return settings
++        }
++    })
++
++    let peers = focusState.get()
++    |> map { state -> [EnginePeer.Id] in
++        return state.settings.alwaysNotify.peerIds.map { EnginePeer.Id($0) }
++    }
++    |> distinctUntilChanged
++    |> mapToSignal { peerIds -> Signal<[EnginePeer.Id: EnginePeer], NoError> in
++        return context.engine.data.subscribe(EngineDataMap(peerIds.map(TelegramEngine.EngineData.Item.Peer.Peer.init(id:))))
++        |> map { peers -> [EnginePeer.Id: EnginePeer] in
++            var result: [EnginePeer.Id: EnginePeer] = [:]
++            for (id, peer) in peers {
++                if let peer {
++                    result[id] = peer
++                }
++            }
++            return result
++        }
++    }
++
++    let signal = combineLatest(queue: .mainQueue(), context.sharedContext.presentationData, focusState.get(), statePromise.get(), peers)
++    |> map { presentationData, state, controllerState, peers -> (ItemListControllerState, (ItemListNodeState, Any)) in
++        let controllerStateValue = ItemListControllerState(presentationData: ItemListPresentationData(presentationData), title: .text(presentationData.strings.FocusModes_Title), leftNavigationButton: nil, rightNavigationButton: nil, backNavigationButton: ItemListBackButton(title: presentationData.strings.Common_Back))
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: focusModesControllerEntries(presentationData: presentationData, state: state, controllerState: controllerState, peers: peers), style: .blocks, animateChanges: true)
++        return (controllerStateValue, (listState, arguments))
++    }
++
++    let controller = ItemListController(context: context, state: signal)
++    presentControllerImpl = { [weak controller] c in
++        controller?.present(c, in: .window(.root))
++    }
++    pushControllerImpl = { [weak controller] c in
++        (controller?.navigationController as? NavigationController)?.pushViewController(c)
++    }
++    return controller
++}
+diff --git a/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModesShared.swift b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModesShared.swift
+new file mode 100644
+index 00000000..c0d1d1c0
+--- /dev/null
++++ b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusModesShared.swift
+@@ -0,0 +1,366 @@
++import Foundation
++import UIKit
++import Display
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import AccountContext
++import AvatarNode
++import ChatListUI
++import FocusModes
++import FocusModesSignals
++
++// MARK: - Icons
++
++private var focusModeIconCache: [String: UIImage] = [:]
++
++/// The mode's glyph on its colour, drawn like the other icons of Settings (30 × 30, 8 pt corners).
++func focusModeIcon(_ symbol: FocusModeSymbol, size: CGFloat = 30.0, cornerRadius: CGFloat? = nil) -> UIImage? {
++    let key = "\(symbol.rawValue)-\(size)"
++    if let image = focusModeIconCache[key] {
++        return image
++    }
++    let color = UIColor(rgb: symbol.rgbColor)
++    let side = size
++    let image = generateImage(CGSize(width: side, height: side), rotatedContext: { size, context in
++        let bounds = CGRect(origin: CGPoint(), size: size)
++        context.clear(bounds)
++
++        let path = UIBezierPath(roundedRect: bounds, cornerRadius: cornerRadius ?? (side * 8.0 / 30.0))
++        context.addPath(path.cgPath)
++        context.clip()
++
++        let colors: [CGColor] = [color.withMultipliedBrightnessBy(1.12).cgColor, color.withMultipliedBrightnessBy(0.9).cgColor]
++        var locations: [CGFloat] = [0.0, 1.0]
++        let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray, locations: &locations)!
++        context.drawLinearGradient(gradient, start: CGPoint(x: 0.0, y: 0.0), end: CGPoint(x: 0.0, y: size.height), options: CGGradientDrawingOptions())
++
++        let configuration = UIImage.SymbolConfiguration(pointSize: floor(side * 0.5), weight: .semibold)
++        if let glyph = UIImage(systemName: symbol.systemImageName, withConfiguration: configuration)?.withTintColor(.white, renderingMode: .alwaysOriginal) {
++            let maxSide = side * 0.62
++            var glyphSize = glyph.size
++            let scale = min(1.0, maxSide / max(glyphSize.width, glyphSize.height))
++            glyphSize = CGSize(width: glyphSize.width * scale, height: glyphSize.height * scale)
++            UIGraphicsPushContext(context)
++            glyph.draw(in: CGRect(origin: CGPoint(x: floor((size.width - glyphSize.width) / 2.0), y: floor((size.height - glyphSize.height) / 2.0)), size: glyphSize))
++            UIGraphicsPopContext()
++        }
++    })
++    if let image {
++        focusModeIconCache[key] = image
++    }
++    return image
++}
++
++func focusModesEntryIcon() -> UIImage? {
++    return focusModeIcon(.doNotDisturb)
++}
++
++func focusFolderCategoryIcon(size: CGFloat) -> UIImage? {
++    let cornerRadius: CGFloat = size > 30.0 ? 12.0 : 6.0
++    return generateAvatarImage(size: CGSize(width: size, height: size), icon: generateTintedImage(image: UIImage(bundleImageName: "Chat List/Filters/Chats"), color: .white), iconScale: size > 30.0 ? 1.0 : 0.6, cornerRadius: cornerRadius, circleCorners: size <= 30.0, color: .blue)
++}
++
++// MARK: - Text
++
++func focusModeSymbolTitle(_ symbol: FocusModeSymbol, strings: PresentationStrings) -> String {
++    switch symbol {
++    case .work:
++        return strings.FocusModes_Symbol_Work
++    case .personal:
++        return strings.FocusModes_Symbol_Personal
++    case .sleep:
++        return strings.FocusModes_Symbol_Sleep
++    case .doNotDisturb:
++        return strings.FocusModes_Symbol_DoNotDisturb
++    case .fitness:
++        return strings.FocusModes_Symbol_Fitness
++    case .reading:
++        return strings.FocusModes_Symbol_Reading
++    case .driving:
++        return strings.FocusModes_Symbol_Driving
++    case .gaming:
++        return strings.FocusModes_Symbol_Gaming
++    case .mindfulness:
++        return strings.FocusModes_Symbol_Mindfulness
++    }
++}
++
++func focusTimeString(minute: Int32, dateTimeFormat: PresentationDateTimeFormat) -> String {
++    let hours = Int(minute / 60) % 24
++    let minutes = Int(minute % 60)
++    switch dateTimeFormat.timeFormat {
++    case .regular:
++        let displayHours = hours % 12 == 0 ? 12 : hours % 12
++        return String(format: "%d:%02d %@", displayHours, minutes, hours < 12 ? "AM" : "PM")
++    case .military:
++        return String(format: "%02d:%02d", hours, minutes)
++    }
++}
++
++/// "Weekdays", "Sat, Sun", "Mon, Wed, Fri".
++func focusWeekdaysString(_ weekdays: [Int], strings: PresentationStrings) -> String {
++    let set = Set(weekdays)
++    if set.count == 7 {
++        return strings.FocusModes_EveryDay
++    }
++    if set == Set(FocusSchedule.workdays) {
++        return strings.FocusModes_Weekdays
++    }
++    if set == Set(FocusSchedule.weekend) {
++        return strings.FocusModes_Weekends
++    }
++    let formatter = DateFormatter()
++    formatter.locale = Locale(identifier: strings.baseLanguageCode)
++    let symbols = formatter.shortWeekdaySymbols ?? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
++    // Monday first.
++    let order = [2, 3, 4, 5, 6, 7, 1]
++    return order.filter { set.contains($0) }.map { symbols[$0 - 1] }.joined(separator: ", ")
++}
++
++func focusScheduleString(_ schedule: FocusSchedule, presentationData: PresentationData) -> (days: String, time: String) {
++    let days = focusWeekdaysString(schedule.weekdays, strings: presentationData.strings)
++    if schedule.isAllDay || schedule.startMinute == schedule.endMinute {
++        return (days, presentationData.strings.FocusModes_AllDay)
++    }
++    return (days, "\(focusTimeString(minute: schedule.startMinute, dateTimeFormat: presentationData.dateTimeFormat)) – \(focusTimeString(minute: schedule.endMinute, dateTimeFormat: presentationData.dateTimeFormat))")
++}
++
++/// "Silences Work and 2 chats. Weekdays 19:00 – 09:00."
++func focusModeSummary(_ mode: FocusMode, presentationData: PresentationData) -> String {
++    let strings = presentationData.strings
++    func describe(_ targets: FocusChatTargets) -> String {
++        var parts: [String] = targets.folders.map(\.title)
++        if !targets.peerIds.isEmpty {
++            parts.append(strings.FocusModes_ChatCount(Int32(targets.peerIds.count)))
++        }
++        if parts.count > 1 {
++            return parts.dropLast().joined(separator: ", ") + " \(strings.FocusModes_And) " + parts.last!
++        } else {
++            return parts.first ?? ""
++        }
++    }
++    var sentences: [String] = []
++    if !mode.hidden.isEmpty {
++        sentences.append(strings.FocusModes_ModeSummaryHides(describe(mode.hidden)).string)
++    }
++    if mode.silencesAllChats {
++        sentences.append(strings.FocusModes_ModeSummaryAll)
++    } else if !mode.silenced.isEmpty {
++        sentences.append(strings.FocusModes_ModeSummarySilences(describe(mode.silenced)).string)
++    }
++    var result = sentences.isEmpty ? strings.FocusModes_ModeSummaryEmpty : sentences.joined(separator: ". ")
++    if let schedule = mode.schedules.first {
++        let (days, time) = focusScheduleString(schedule, presentationData: presentationData)
++        result += ". \(days), \(time)"
++        if mode.schedules.count > 1 {
++            result += " +\(mode.schedules.count - 1)"
++        }
++    }
++    return result
++}
++
++func focusActivationString(_ activeMode: FocusActiveMode, presentationData: PresentationData) -> String {
++    switch activeMode.source {
++    case let .manual(until):
++        if let until {
++            let date = Date(timeIntervalSince1970: Double(until))
++            let calendar = Calendar.current
++            let components = calendar.dateComponents([.hour, .minute], from: date)
++            let time = focusTimeString(minute: Int32((components.hour ?? 0) * 60 + (components.minute ?? 0)), dateTimeFormat: presentationData.dateTimeFormat)
++            return presentationData.strings.FocusModes_SourceManualUntil(time).string
++        } else {
++            return presentationData.strings.FocusModes_SourceManual
++        }
++    case .systemFocus:
++        return presentationData.strings.FocusModes_SourceSystem
++    case .schedule:
++        return presentationData.strings.FocusModes_SourceSchedule
++    }
++}
++
++// MARK: - Folders
++
++/// The chats a folder holds now: its included chats plus those its chat types (contacts, groups...) bring in.
++func focusResolveFolderPeerIds(context: AccountContext, folder: ChatListFilter) -> Signal<[Int64], NoError> {
++    guard case let .filter(_, _, _, data) = folder else {
++        return .single([])
++    }
++    let explicitPeerIds = data.includePeers.peers.map { $0.toInt64() }
++    if data.categories.isEmpty {
++        return .single(explicitPeerIds)
++    }
++    let predicate = chatListFilterPredicate(filter: data, accountPeerId: context.account.peerId)
++    return context.engine.messages.chatListPeers(group: .root, filterPredicate: predicate, count: 1000)
++    |> take(1)
++    |> map { peers, _ -> [Int64] in
++        var result = explicitPeerIds
++        for peer in peers {
++            let id = peer.id.toInt64()
++            if !result.contains(id) {
++                result.append(id)
++            }
++        }
++        return result
++    }
++}
++
++private func focusFolderSnapshot(context: AccountContext, folder: ChatListFilter) -> Signal<FocusChatFolder?, NoError> {
++    guard case let .filter(id, title, emoticon, _) = folder else {
++        return .single(nil)
++    }
++    return focusResolveFolderPeerIds(context: context, folder: folder)
++    |> map { peerIds -> FocusChatFolder? in
++        return FocusChatFolder(accountPeerId: context.account.peerId.toInt64(), id: id, title: title.text, emoticon: emoticon, peerIds: peerIds)
++    }
++}
++
++private func refreshedTargets(_ targets: FocusChatTargets, accountPeerId: Int64, snapshots: [Int32: FocusChatFolder], existingFolderIds: Set<Int32>) -> FocusChatTargets {
++    var targets = targets
++    targets.folders = targets.folders.compactMap { folder -> FocusChatFolder? in
++        if folder.accountPeerId != accountPeerId {
++            return folder
++        }
++        if !existingFolderIds.contains(folder.id) {
++            // The folder was deleted.
++            return nil
++        }
++        return snapshots[folder.id] ?? folder
++    }
++    return targets
++}
++
++/// Keeps the stored contents of the folders in Focus rules up to date while the app runs: the notification
++/// extension knows a folder only by the chats stored with it.
++public final class FocusModesFolderSynchronizer {
++    private let disposable = MetaDisposable()
++
++    public init(context: AccountContext) {
++        let rootPath = context.sharedContext.basePath
++        let accountPeerId = context.account.peerId.toInt64()
++
++        let referencedFolderIds = focusModesState(rootPath: rootPath)
++        |> map { state -> Set<Int32> in
++            var result = Set<Int32>()
++            let targets = [state.settings.alwaysNotify] + state.settings.modes.map(\.silenced) + state.settings.modes.map(\.hidden)
++            for target in targets {
++                for folder in target.folders where folder.accountPeerId == accountPeerId {
++                    result.insert(folder.id)
++                }
++            }
++            return result
++        }
++        |> distinctUntilChanged
++
++        let signal = combineLatest(referencedFolderIds, context.engine.peers.updatedChatListFilters())
++        |> mapToSignal { folderIds, filters -> Signal<(Set<Int32>, [Int32: FocusChatFolder]), NoError> in
++            let existing = Set(filters.map(\.id))
++            let referenced = filters.filter { folderIds.contains($0.id) }
++            if referenced.isEmpty {
++                return .single((existing, [:]))
++            }
++            return combineLatest(referenced.map { focusFolderSnapshot(context: context, folder: $0) })
++            |> map { snapshots -> (Set<Int32>, [Int32: FocusChatFolder]) in
++                var result: [Int32: FocusChatFolder] = [:]
++                for snapshot in snapshots {
++                    if let snapshot {
++                        result[snapshot.id] = snapshot
++                    }
++                }
++                return (existing, result)
++            }
++        }
++        |> delay(1.0, queue: Queue.concurrentDefaultQueue())
++
++        self.disposable.set(signal.start(next: { existing, snapshots in
++            FocusModesStore.updateSettings(rootPath: rootPath, { settings in
++                var settings = settings
++                settings.alwaysNotify = refreshedTargets(settings.alwaysNotify, accountPeerId: accountPeerId, snapshots: snapshots, existingFolderIds: existing)
++                for i in 0 ..< settings.modes.count {
++                    settings.modes[i].silenced = refreshedTargets(settings.modes[i].silenced, accountPeerId: accountPeerId, snapshots: snapshots, existingFolderIds: existing)
++                    settings.modes[i].hidden = refreshedTargets(settings.modes[i].hidden, accountPeerId: accountPeerId, snapshots: snapshots, existingFolderIds: existing)
++                }
++                return settings
++            })
++        }))
++    }
++
++    deinit {
++        self.disposable.dispose()
++    }
++}
++
++// MARK: - Picker
++
++private let folderCategoryIdOffset = 1_000_000
++
++/// The chat picker of the folder editor, with the account's folders listed above the chats.
++func presentFocusTargetsPicker(context: AccountContext, title: String, current: FocusChatTargets, push: @escaping (ViewController) -> Void, completion: @escaping (FocusChatTargets) -> Void) {
++    let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++    let accountPeerId = context.account.peerId.toInt64()
++
++    let _ = (context.engine.peers.currentChatListFilters()
++    |> take(1)
++    |> deliverOnMainQueue).start(next: { filters in
++        var categories: [ChatListNodeAdditionalCategory] = []
++        var selectedCategories = Set<Int>()
++        for filter in filters {
++            guard case let .filter(id, folderTitle, _, _) = filter else {
++                continue
++            }
++            categories.append(ChatListNodeAdditionalCategory(
++                id: folderCategoryIdOffset + Int(id),
++                icon: focusFolderCategoryIcon(size: 40.0),
++                smallIcon: focusFolderCategoryIcon(size: 22.0),
++                title: folderTitle.text,
++                appearance: .option(sectionTitle: presentationData.strings.FocusModes_FoldersSection)
++            ))
++            if current.containsFolder(accountPeerId: accountPeerId, id: id) {
++                selectedCategories.insert(folderCategoryIdOffset + Int(id))
++            }
++        }
++
++        let selectedChats = Set(current.peerIds.map { EnginePeer.Id($0) })
++        let controller = context.sharedContext.makeContactMultiselectionController(ContactMultiselectionControllerParams(context: context, mode: .chatSelection(ContactMultiselectionControllerMode.ChatSelection(
++            title: title,
++            searchPlaceholder: presentationData.strings.ChatListFilter_AddChatsSearchPlaceholder,
++            selectedChats: selectedChats,
++            additionalCategories: categories.isEmpty ? nil : ContactMultiselectionControllerAdditionalCategories(categories: categories, selectedCategories: selectedCategories),
++            chatListFilters: filters
++        )), filters: [], alwaysEnabled: true, limit: nil, reachedLimit: nil))
++        controller.navigationPresentation = .modal
++        push(controller)
++
++        let _ = (controller.result
++        |> take(1)
++        |> deliverOnMainQueue).start(next: { [weak controller] result in
++            guard case let .result(peerIds, additionalCategoryIds) = result else {
++                controller?.dismiss()
++                return
++            }
++            var updated = FocusChatTargets()
++            for peerId in peerIds {
++                if case let .peer(id) = peerId {
++                    updated.peerIds.append(id.toInt64())
++                }
++            }
++            // Folders of other accounts stay as they were.
++            updated.folders = current.folders.filter { $0.accountPeerId != accountPeerId }
++
++            let pickedFolders = filters.filter { additionalCategoryIds.contains(folderCategoryIdOffset + Int($0.id)) }
++            let snapshots: Signal<[FocusChatFolder?], NoError>
++            if pickedFolders.isEmpty {
++                snapshots = .single([])
++            } else {
++                snapshots = combineLatest(pickedFolders.map { focusFolderSnapshot(context: context, folder: $0) })
++            }
++            let _ = (snapshots
++            |> take(1)
++            |> deliverOnMainQueue).start(next: { snapshots in
++                updated.folders.append(contentsOf: snapshots.compactMap { $0 })
++                completion(updated)
++                controller?.dismiss()
++            })
++        })
++    })
++}
+diff --git a/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusTimeItem.swift b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusTimeItem.swift
+new file mode 100644
+index 00000000..60bf3cc2
+--- /dev/null
++++ b/submodules/SettingsUI/Sources/Notifications/FocusModes/FocusTimeItem.swift
+@@ -0,0 +1,208 @@
++import Foundation
++import UIKit
++import Display
++import AsyncDisplayKit
++import SwiftSignalKit
++import TelegramPresentationData
++import ItemListUI
++
++/// "From  [19:00]": a title and the system's compact time picker, as in the schedule of an iOS Focus.
++final class FocusTimeItem: ListViewItem, ItemListItem {
++    let presentationData: ItemListPresentationData
++    let systemStyle: ItemListSystemStyle
++    let title: String
++    /// Minutes from midnight.
++    let minute: Int32
++    let sectionId: ItemListSectionId
++    let updated: (Int32) -> Void
++
++    init(presentationData: ItemListPresentationData, systemStyle: ItemListSystemStyle, title: String, minute: Int32, sectionId: ItemListSectionId, updated: @escaping (Int32) -> Void) {
++        self.presentationData = presentationData
++        self.systemStyle = systemStyle
++        self.title = title
++        self.minute = minute
++        self.sectionId = sectionId
++        self.updated = updated
++    }
++
++    func nodeConfiguredForParams(async: @escaping (@escaping () -> Void) -> Void, params: ListViewItemLayoutParams, synchronousLoads: Bool, neighbors: ListViewItemNeighbors, completion: @escaping (ListViewItemNode, @escaping () -> (Signal<Void, NoError>?, (ListViewItemApply) -> Void)) -> Void) {
++        async {
++            let node = FocusTimeItemNode()
++            let (layout, apply) = node.asyncLayout()(self, params, itemListNeighbors(item: self, topFacet: neighbors.previous?.base(ItemListNeighborFacet.self), bottomFacet: neighbors.next?.base(ItemListNeighborFacet.self)))
++            node.contentSize = layout.contentSize
++            node.insets = layout.insets
++            Queue.mainQueue().async {
++                completion(node, {
++                    return (nil, { _ in apply(.None) })
++                })
++            }
++        }
++    }
++
++    func updateNode(async: @escaping (@escaping () -> Void) -> Void, node: @escaping () -> ListViewItemNode, params: ListViewItemLayoutParams, neighbors: ListViewItemNeighbors, animation: ListViewItemUpdateAnimation, completion: @escaping (ListViewItemNodeLayout, @escaping (ListViewItemApply) -> Void) -> Void) {
++        Queue.mainQueue().async {
++            if let nodeValue = node() as? FocusTimeItemNode {
++                let makeLayout = nodeValue.asyncLayout()
++                async {
++                    let (layout, apply) = makeLayout(self, params, itemListNeighbors(item: self, topFacet: neighbors.previous?.base(ItemListNeighborFacet.self), bottomFacet: neighbors.next?.base(ItemListNeighborFacet.self)))
++                    Queue.mainQueue().async {
++                        completion(layout, { _ in
++                            apply(animation)
++                        })
++                    }
++                }
++            }
++        }
++    }
++
++    var selectable: Bool {
++        return false
++    }
++}
++
++private func dateForMinute(_ minute: Int32) -> Date {
++    let calendar = Calendar.current
++    let startOfDay = calendar.startOfDay(for: Date())
++    return calendar.date(byAdding: .minute, value: Int(minute), to: startOfDay) ?? startOfDay
++}
++
++final class FocusTimeItemNode: ListViewItemNode, ItemListItemNode {
++    private let backgroundNode: ASDisplayNode
++    private let topStripeNode: ASDisplayNode
++    private let bottomStripeNode: ASDisplayNode
++    private let maskNode: ASImageNode
++    private let titleNode: TextNode
++    private var datePicker: UIDatePicker?
++
++    private var item: FocusTimeItem?
++
++    var tag: ItemListItemTag? {
++        return nil
++    }
++
++    override var canBeSelected: Bool {
++        return false
++    }
++
++    init() {
++        self.backgroundNode = ASDisplayNode()
++        self.backgroundNode.isLayerBacked = true
++        self.topStripeNode = ASDisplayNode()
++        self.topStripeNode.isLayerBacked = true
++        self.bottomStripeNode = ASDisplayNode()
++        self.bottomStripeNode.isLayerBacked = true
++        self.maskNode = ASImageNode()
++        self.maskNode.isUserInteractionEnabled = false
++        self.titleNode = TextNode()
++        self.titleNode.isUserInteractionEnabled = false
++
++        super.init(layerBacked: false)
++
++        self.addSubnode(self.titleNode)
++    }
++
++    @objc private func datePickerChanged(_ datePicker: UIDatePicker) {
++        let components = Calendar.current.dateComponents([.hour, .minute], from: datePicker.date)
++        self.item?.updated(Int32((components.hour ?? 0) * 60 + (components.minute ?? 0)))
++    }
++
++    func asyncLayout() -> (_ item: FocusTimeItem, _ params: ListViewItemLayoutParams, _ neighbors: ItemListNeighbors) -> (ListViewItemNodeLayout, (ListViewItemUpdateAnimation) -> Void) {
++        let makeTitleLayout = TextNode.asyncLayout(self.titleNode)
++        let currentItem = self.item
++
++        return { [weak self] item, params, neighbors in
++            let themeUpdated = currentItem?.presentationData.theme !== item.presentationData.theme
++            let leftInset = 16.0 + params.leftInset
++            let height: CGFloat = item.systemStyle == .glass ? 52.0 : 44.0
++            let contentSize = CGSize(width: params.width, height: height)
++            let insets = itemListNeighborsGroupedInsets(neighbors, params)
++            let separatorHeight = UIScreenPixel
++
++            let (titleLayout, titleApply) = makeTitleLayout(TextNodeLayoutArguments(attributedString: NSAttributedString(string: item.title, font: Font.regular(item.presentationData.fontSize.itemListBaseFontSize), textColor: item.presentationData.theme.list.itemPrimaryTextColor), backgroundColor: nil, maximumNumberOfLines: 1, truncationType: .end, constrainedSize: CGSize(width: params.width - leftInset - 140.0, height: .greatestFiniteMagnitude), alignment: .natural, cutout: nil, insets: UIEdgeInsets()))
++
++            return (ListViewItemNodeLayout(contentSize: contentSize, insets: insets), { [weak self] _ in
++                guard let self else {
++                    return
++                }
++                self.item = item
++                let _ = titleApply()
++
++                if themeUpdated {
++                    self.backgroundNode.backgroundColor = item.presentationData.theme.list.itemBlocksBackgroundColor
++                    self.topStripeNode.backgroundColor = item.presentationData.theme.list.itemBlocksSeparatorColor
++                    self.bottomStripeNode.backgroundColor = item.presentationData.theme.list.itemBlocksSeparatorColor
++                }
++                if self.backgroundNode.supernode == nil {
++                    self.insertSubnode(self.backgroundNode, at: 0)
++                }
++                if self.topStripeNode.supernode == nil {
++                    self.insertSubnode(self.topStripeNode, at: 1)
++                }
++                if self.bottomStripeNode.supernode == nil {
++                    self.insertSubnode(self.bottomStripeNode, at: 2)
++                }
++                if self.maskNode.supernode == nil {
++                    self.addSubnode(self.maskNode)
++                }
++
++                let hasCorners = itemListHasRoundedBlockLayout(params)
++                var hasTopCorners = false
++                var hasBottomCorners = false
++                switch neighbors.top {
++                case .sameSection(false):
++                    self.topStripeNode.isHidden = true
++                default:
++                    hasTopCorners = true
++                    self.topStripeNode.isHidden = hasCorners
++                }
++                let bottomStripeInset: CGFloat
++                switch neighbors.bottom {
++                case .sameSection(false):
++                    bottomStripeInset = leftInset
++                    self.bottomStripeNode.isHidden = false
++                default:
++                    bottomStripeInset = 0.0
++                    hasBottomCorners = true
++                    self.bottomStripeNode.isHidden = hasCorners
++                }
++                self.maskNode.image = hasCorners ? PresentationResourcesItemList.cornersImage(item.presentationData.theme, top: hasTopCorners, bottom: hasBottomCorners, glass: item.systemStyle == .glass) : nil
++
++                self.backgroundNode.frame = CGRect(origin: CGPoint(x: 0.0, y: -min(insets.top, separatorHeight)), size: CGSize(width: params.width, height: contentSize.height + min(insets.top, separatorHeight) + min(insets.bottom, separatorHeight)))
++                self.maskNode.frame = self.backgroundNode.frame.inset(by: UIEdgeInsets(top: 0.0, left: params.leftInset, bottom: 0.0, right: params.rightInset))
++                self.topStripeNode.frame = CGRect(origin: CGPoint(x: 0.0, y: -min(insets.top, separatorHeight)), size: CGSize(width: params.width, height: separatorHeight))
++                self.bottomStripeNode.frame = CGRect(origin: CGPoint(x: bottomStripeInset, y: contentSize.height - separatorHeight), size: CGSize(width: params.width - bottomStripeInset, height: separatorHeight))
++
++                self.titleNode.frame = CGRect(origin: CGPoint(x: leftInset, y: floor((height - titleLayout.size.height) / 2.0)), size: titleLayout.size)
++
++                let datePicker: UIDatePicker
++                if let current = self.datePicker {
++                    datePicker = current
++                } else {
++                    datePicker = UIDatePicker()
++                    datePicker.datePickerMode = .time
++                    datePicker.preferredDatePickerStyle = .compact
++                    datePicker.minuteInterval = 5
++                    datePicker.addTarget(self, action: #selector(self.datePickerChanged(_:)), for: .valueChanged)
++                    self.view.addSubview(datePicker)
++                    self.datePicker = datePicker
++                }
++                datePicker.tintColor = item.presentationData.theme.list.itemAccentColor
++                datePicker.overrideUserInterfaceStyle = item.presentationData.theme.overallDarkAppearance ? .dark : .light
++                let date = dateForMinute(item.minute)
++                if datePicker.date != date {
++                    datePicker.setDate(date, animated: false)
++                }
++                let pickerSize = datePicker.sizeThatFits(CGSize(width: 200.0, height: height))
++                datePicker.frame = CGRect(origin: CGPoint(x: params.width - params.rightInset - 16.0 - pickerSize.width, y: floor((height - pickerSize.height) / 2.0)), size: pickerSize)
++            })
++        }
++    }
++
++    override func animateInsertion(_ currentTimestamp: Double, duration: Double, options: ListViewItemAnimationOptions) {
++        self.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.4)
++    }
++
++    override func animateRemoved(_ currentTimestamp: Double, duration: Double) {
++        self.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.15, removeOnCompletion: false)
++    }
++}
+diff --git a/submodules/SettingsUI/Sources/Notifications/NotificationsAndSoundsController.swift b/submodules/SettingsUI/Sources/Notifications/NotificationsAndSoundsController.swift
+index 600e5a67..91a0e908 100644
+--- a/submodules/SettingsUI/Sources/Notifications/NotificationsAndSoundsController.swift
++++ b/submodules/SettingsUI/Sources/Notifications/NotificationsAndSoundsController.swift
+@@ -16,6 +16,8 @@ import NotificationSoundSelectionUI
+ import TelegramStringFormatting
+ import NotificationPeerExceptionController
+ import AlertComponent
++import FocusModes
++import FocusModesSignals
+ 
+ private struct CounterTagSettings: OptionSet {
+     var rawValue: Int32
+@@ -64,6 +66,7 @@ private final class NotificationsAndSoundsArguments {
+     
+     let openPeerCategory: (NotificationsPeerCategory) -> Void
+     let openReactions: () -> Void
++    let openFocusModes: () -> Void
+         
+     let updateInAppSounds: (Bool) -> Void
+     let updateInAppVibration: (Bool) -> Void
+@@ -81,7 +84,7 @@ private final class NotificationsAndSoundsArguments {
+     
+     let updateNotificationsFromAllAccounts: (Bool) -> Void
+     
+-    init(context: AccountContext, presentController: @escaping (ViewController, ViewControllerPresentationArguments?) -> Void, pushController: @escaping(ViewController)->Void, soundSelectionDisposable: MetaDisposable, authorizeNotifications: @escaping () -> Void, suppressWarning: @escaping () -> Void, openPeerCategory: @escaping (NotificationsPeerCategory) -> Void, openReactions: @escaping () -> Void, updateInAppSounds: @escaping (Bool) -> Void, updateInAppVibration: @escaping (Bool) -> Void, updateInAppPreviews: @escaping (Bool) -> Void, updateDisplayNameOnLockscreen: @escaping (Bool) -> Void, updateIncludeTag: @escaping (CounterTagSettings, Bool) -> Void, updateTotalUnreadCountCategory: @escaping (Bool) -> Void, resetNotifications: @escaping () -> Void, openAppSettings: @escaping () -> Void, updateJoinedNotifications: @escaping (Bool) -> Void, updateNotificationsFromAllAccounts: @escaping (Bool) -> Void) {
++    init(context: AccountContext, presentController: @escaping (ViewController, ViewControllerPresentationArguments?) -> Void, pushController: @escaping(ViewController)->Void, soundSelectionDisposable: MetaDisposable, authorizeNotifications: @escaping () -> Void, suppressWarning: @escaping () -> Void, openPeerCategory: @escaping (NotificationsPeerCategory) -> Void, openReactions: @escaping () -> Void, openFocusModes: @escaping () -> Void, updateInAppSounds: @escaping (Bool) -> Void, updateInAppVibration: @escaping (Bool) -> Void, updateInAppPreviews: @escaping (Bool) -> Void, updateDisplayNameOnLockscreen: @escaping (Bool) -> Void, updateIncludeTag: @escaping (CounterTagSettings, Bool) -> Void, updateTotalUnreadCountCategory: @escaping (Bool) -> Void, resetNotifications: @escaping () -> Void, openAppSettings: @escaping () -> Void, updateJoinedNotifications: @escaping (Bool) -> Void, updateNotificationsFromAllAccounts: @escaping (Bool) -> Void) {
+         self.context = context
+         self.presentController = presentController
+         self.pushController = pushController
+@@ -90,6 +93,7 @@ private final class NotificationsAndSoundsArguments {
+         self.suppressWarning = suppressWarning
+         self.openPeerCategory = openPeerCategory
+         self.openReactions = openReactions
++        self.openFocusModes = openFocusModes
+         self.updateInAppSounds = updateInAppSounds
+         self.updateInAppVibration = updateInAppVibration
+         self.updateInAppPreviews = updateInAppPreviews
+@@ -107,6 +111,7 @@ private enum NotificationsAndSoundsSection: Int32 {
+     case accounts
+     case permission
+     case categories
++    case focus
+     case inApp
+     case displayNamesOnLockscreen
+     case badge
+@@ -149,6 +154,9 @@ private enum NotificationsAndSoundsEntry: ItemListNodeEntry {
+     case stories(PresentationTheme, String, String, String)
+     case reactions(PresentationTheme, String, String, String)
+     
++    case focusModes(PresentationTheme, String, String, String)
++    case focusModesInfo(PresentationTheme, String)
++    
+     case inAppHeader(PresentationTheme, String)
+     case inAppSounds(PresentationTheme, String, Bool)
+     case inAppVibrate(PresentationTheme, String, Bool)
+@@ -176,6 +184,8 @@ private enum NotificationsAndSoundsEntry: ItemListNodeEntry {
+                 return NotificationsAndSoundsSection.permission.rawValue
+             case .categoriesHeader, .privateChats, .groupChats, .channels, .stories, .reactions:
+                 return NotificationsAndSoundsSection.categories.rawValue
++            case .focusModes, .focusModesInfo:
++                return NotificationsAndSoundsSection.focus.rawValue
+             case .inAppHeader, .inAppSounds, .inAppVibrate, .inAppPreviews:
+                 return NotificationsAndSoundsSection.inApp.rawValue
+             case .displayNamesOnLockscreen, .displayNamesOnLockscreenInfo:
+@@ -213,6 +223,10 @@ private enum NotificationsAndSoundsEntry: ItemListNodeEntry {
+                 return 9
+             case .reactions:
+                 return 10
++            case .focusModes:
++                return 11
++            case .focusModesInfo:
++                return 12
+             case .inAppHeader:
+                 return 14
+             case .inAppSounds:
+@@ -337,6 +351,18 @@ private enum NotificationsAndSoundsEntry: ItemListNodeEntry {
+                 } else {
+                     return false
+                 }
++            case let .focusModes(lhsTheme, lhsTitle, lhsSubtitle, lhsLabel):
++                if case let .focusModes(rhsTheme, rhsTitle, rhsSubtitle, rhsLabel) = rhs, lhsTheme === rhsTheme, lhsTitle == rhsTitle, lhsSubtitle == rhsSubtitle, lhsLabel == rhsLabel {
++                    return true
++                } else {
++                    return false
++                }
++            case let .focusModesInfo(lhsTheme, lhsText):
++                if case let .focusModesInfo(rhsTheme, rhsText) = rhs, lhsTheme === rhsTheme, lhsText == rhsText {
++                    return true
++                } else {
++                    return false
++                }
+             case let .inAppHeader(lhsTheme, lhsText):
+                 if case let .inAppHeader(rhsTheme, rhsText) = rhs, lhsTheme === rhsTheme, lhsText == rhsText {
+                     return true
+@@ -469,6 +495,12 @@ private enum NotificationsAndSoundsEntry: ItemListNodeEntry {
+                 return NotificationsCategoryItemListItem(presentationData: presentationData, systemStyle: .glass, icon: PresentationResourcesSettings.reactions, title: title, subtitle: subtitle, label: label, sectionId: self.section, style: .blocks, action: {
+                     arguments.openReactions()
+                 })
++            case let .focusModes(_, title, subtitle, label):
++                return NotificationsCategoryItemListItem(presentationData: presentationData, systemStyle: .glass, icon: focusModesEntryIcon(), title: title, subtitle: subtitle, label: label, sectionId: self.section, style: .blocks, action: {
++                    arguments.openFocusModes()
++                })
++            case let .focusModesInfo(_, text):
++                return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
+             case let .inAppHeader(_, text):
+                 return ItemListSectionHeaderItem(presentationData: presentationData, text: text, sectionId: self.section)
+             case let .inAppSounds(_, text, value):
+@@ -527,7 +559,7 @@ private func filteredGlobalSound(_ sound: PeerMessageSound) -> PeerMessageSound
+     }
+ }
+ 
+-private func notificationsAndSoundsEntries(authorizationStatus: AccessType, warningSuppressed: Bool, globalSettings: GlobalNotificationSettingsSet, inAppSettings: InAppNotificationSettings, exceptions: (users: NotificationExceptionMode, groups: NotificationExceptionMode, channels: NotificationExceptionMode, stories: NotificationExceptionMode), presentationData: PresentationData, hasMoreThanOneAccount: Bool) -> [NotificationsAndSoundsEntry] {
++private func notificationsAndSoundsEntries(authorizationStatus: AccessType, warningSuppressed: Bool, globalSettings: GlobalNotificationSettingsSet, inAppSettings: InAppNotificationSettings, exceptions: (users: NotificationExceptionMode, groups: NotificationExceptionMode, channels: NotificationExceptionMode, stories: NotificationExceptionMode), presentationData: PresentationData, hasMoreThanOneAccount: Bool, focusState: FocusModesState) -> [NotificationsAndSoundsEntry] {
+     var entries: [NotificationsAndSoundsEntry] = []
+     
+     if hasMoreThanOneAccount {
+@@ -601,6 +633,15 @@ private func notificationsAndSoundsEntries(authorizationStatus: AccessType, warn
+     }
+     entries.append(.reactions(presentationData.theme, presentationData.strings.Notifications_Reactions, reactionsValue, hasReactionNotifications ? presentationData.strings.Notifications_On : presentationData.strings.Notifications_Off))
+     
++    let focusSubtitle: String
++    if let activeMode = focusState.activeMode {
++        focusSubtitle = presentationData.strings.FocusModes_RowActive(activeMode.mode.title).string
++    } else {
++        focusSubtitle = presentationData.strings.FocusModes_NotificationsRowInfo
++    }
++    entries.append(.focusModes(presentationData.theme, presentationData.strings.FocusModes_Title, focusSubtitle, focusState.activeMode != nil ? presentationData.strings.FocusModes_On : presentationData.strings.Notifications_Off))
++    entries.append(.focusModesInfo(presentationData.theme, presentationData.strings.FocusModes_NotificationsInfo))
++    
+     entries.append(.inAppHeader(presentationData.theme, presentationData.strings.Notifications_InAppNotifications.uppercased()))
+     entries.append(.inAppSounds(presentationData.theme, presentationData.strings.Notifications_InAppNotificationsSounds, inAppSettings.playSounds))
+     entries.append(.inAppVibrate(presentationData.theme, presentationData.strings.Notifications_InAppNotificationsVibrate, inAppSettings.vibrate))
+@@ -696,6 +737,8 @@ public func notificationsAndSoundsController(context: AccountContext, exceptions
+         pushControllerImpl?(reactionNotificationSettingsController(
+             context: context
+         ))
++    }, openFocusModes: {
++        pushControllerImpl?(focusModesController(context: context))
+     }, updateInAppSounds: { value in
+         let _ = updateInAppNotificationSettingsInteractively(accountManager: context.sharedContext.accountManager, { settings in
+             var settings = settings
+@@ -850,8 +893,8 @@ public func notificationsAndSoundsController(context: AccountContext, exceptions
+     }
+     |> distinctUntilChanged
+     
+-    let signal = combineLatest(context.sharedContext.presentationData, sharedData, preferences, notificationExceptions.get(), DeviceAccess.authorizationStatus(applicationInForeground: context.sharedContext.applicationBindings.applicationInForeground, subject: .notifications), notificationsWarningSuppressed.get(), hasMoreThanOneAccount)
+-        |> map { presentationData, sharedData, view, exceptions, authorizationStatus, warningSuppressed, hasMoreThanOneAccount -> (ItemListControllerState, (ItemListNodeState, Any)) in
++    let signal = combineLatest(context.sharedContext.presentationData, sharedData, preferences, notificationExceptions.get(), DeviceAccess.authorizationStatus(applicationInForeground: context.sharedContext.applicationBindings.applicationInForeground, subject: .notifications), notificationsWarningSuppressed.get(), hasMoreThanOneAccount, focusModesState(rootPath: context.sharedContext.basePath))
++        |> map { presentationData, sharedData, view, exceptions, authorizationStatus, warningSuppressed, hasMoreThanOneAccount, focusState -> (ItemListControllerState, (ItemListNodeState, Any)) in
+             
+             let viewSettings: GlobalNotificationSettingsSet
+             if let settings = view?.get(GlobalNotificationSettings.self) {
+@@ -867,7 +910,7 @@ public func notificationsAndSoundsController(context: AccountContext, exceptions
+                 inAppSettings = InAppNotificationSettings.defaultSettings
+             }
+             
+-            let entries = notificationsAndSoundsEntries(authorizationStatus: authorizationStatus, warningSuppressed: warningSuppressed, globalSettings: viewSettings, inAppSettings: inAppSettings, exceptions: exceptions, presentationData: presentationData, hasMoreThanOneAccount: hasMoreThanOneAccount)
++            let entries = notificationsAndSoundsEntries(authorizationStatus: authorizationStatus, warningSuppressed: warningSuppressed, globalSettings: viewSettings, inAppSettings: inAppSettings, exceptions: exceptions, presentationData: presentationData, hasMoreThanOneAccount: hasMoreThanOneAccount, focusState: focusState)
+             
+             var index = 0
+             var scrollToItem: ListViewScrollToItem?
+diff --git a/submodules/TelegramUI/BUILD b/submodules/TelegramUI/BUILD
+index 116004c3..e3db69f8 100644
+--- a/submodules/TelegramUI/BUILD
++++ b/submodules/TelegramUI/BUILD
+@@ -210,6 +210,7 @@ swift_library(
+         "//submodules/ShareItems:ShareItems",
+         "//submodules/ShareItems/Impl:ShareItemsImpl",
+         "//submodules/SettingsUI:SettingsUI",
++        "//submodules/FocusModes:FocusModes",
+         "//submodules/UrlHandling:UrlHandling",
+         "//submodules/HexColor:HexColor",
+         "//submodules/QrCode:QrCode",
+diff --git a/submodules/TelegramUI/Sources/ApplicationContext.swift b/submodules/TelegramUI/Sources/ApplicationContext.swift
+index 17119cc3..a99014a0 100644
+--- a/submodules/TelegramUI/Sources/ApplicationContext.swift
++++ b/submodules/TelegramUI/Sources/ApplicationContext.swift
+@@ -33,6 +33,7 @@ import AttachmentUI
+ import MinimizedContainer
+ import BrowserUI
+ import NewsFeedSupport
++import FocusModes
+ 
+ final class UnauthorizedApplicationContext {
+     let sharedContext: SharedAccountContextImpl
+@@ -115,6 +116,7 @@ final class AuthorizedApplicationContext {
+     private let passcodeLockDisposable = MetaDisposable()
+     private let loggedOutDisposable = MetaDisposable()
+     private let inAppNotificationSettingsDisposable = MetaDisposable()
++    private var focusModesFolderSynchronizer: FocusModesFolderSynchronizer?
+     private let notificationMessagesDisposable = MetaDisposable()
+     private let termsOfServiceUpdatesDisposable = MetaDisposable()
+     private let termsOfServiceProceedToBotDisposable = MetaDisposable()
+@@ -293,7 +295,10 @@ final class AuthorizedApplicationContext {
+             }
+         }))
+ 
++        self.focusModesFolderSynchronizer = FocusModesFolderSynchronizer(context: context)
++
+         let engine = context.engine
++        let focusModesRootPath = context.sharedContext.basePath
+         self.notificationMessagesDisposable.set((context.account.stateManager.notificationMessages
+         |> mapToSignal { messageList in
+             return engine.data.get(EngineDataMap(
+@@ -306,10 +311,17 @@ final class AuthorizedApplicationContext {
+                 }
+             ))
+             |> map { chatListIndexMap in
++                // A chat silenced by the active Focus mode gets no banner, sound or vibration in the app either.
++                let focusSettings = FocusModesStore.loadSettings(rootPath: focusModesRootPath)
++                let focusSystemState = FocusModesStore.loadSystemState(rootPath: focusModesRootPath)
++                let now = Date()
+                 return messageList.filter { item in
+                     guard let message = item.0.first else {
+                         return false
+                     }
++                    if case .silenced = focusSettings.notificationDecision(peerId: message.id.peerId.toInt64(), systemState: focusSystemState, at: now) {
++                        return false
++                    }
+                     if let maybeChatListIndex = chatListIndexMap[message.id.peerId], maybeChatListIndex != nil {
+                         return true
+                     } else {

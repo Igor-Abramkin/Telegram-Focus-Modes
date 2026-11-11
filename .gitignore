@@ -1,0 +1,7 @@
+.DS_Store
+# The modified Telegram-iOS checkout the patch was made from.
+Telegram-iOS/
+# Recording takes, renders and scripts behind demo.mp4.
+video/
+# Uncomposed simulator screenshots behind screenshots/*.png.
+screenshots/raw/
