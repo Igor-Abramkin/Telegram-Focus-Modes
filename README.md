@@ -5,6 +5,10 @@ whole, so in the evening the work group keeps buzzing, or the family goes quiet 
 follow your Focus chat by chat: work folders disappear after hours, other chats go quiet, and the family always gets
 through.
 
+<p align="center">
+  <a href="demo.mp4"><img src="demo.gif" alt="Demo: turning on the Personal mode hides the Work folder and silences the Social folder" width="420"></a>
+</p>
+
 [Demo video](demo.mp4): the Personal mode is set up to hide the Work folder and silence the Social folder, it is turned
 on, and back in the chat list the Work tab and its chats leave while a toast says what happened. **Turn Off** in the
 toast brings them back. Recorded in the iOS Simulator with [showtime](https://github.com/mishanaer/showtime) on a build of this patch;
