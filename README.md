@@ -6,7 +6,7 @@ follow your Focus chat by chat: work folders disappear after hours, other chats 
 through.
 
 <p align="center">
-  <a href="demo.mp4"><img src="demo.gif" alt="Demo: turning on the Personal mode hides the Work folder and silences the Social folder" width="640"></a>
+  <a href="demo.mp4"><img src="demo-preview.gif" alt="Demo: turning on the Personal mode hides the Work folder and silences the Social folder" width="640"></a>
 </p>
 
 [Demo video](demo.mp4): the Personal mode is set up to hide the Work folder and silence the Social folder, it is turned
