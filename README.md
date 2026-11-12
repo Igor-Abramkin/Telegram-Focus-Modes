@@ -12,7 +12,8 @@ through.
 [Demo video](demo.mp4): the Personal mode is set up to hide the Work folder and silence the Social folder, it is turned
 on, and back in the chat list the Work tab and its chats leave while a toast says what happened. **Turn Off** in the
 toast brings them back. Recorded in the iOS Simulator with [showtime](https://github.com/mishanaer/showtime) on a build of this patch;
-a local recording filter, not part of the patch, kept everything except the demo chats off screen.
+a local recording filter, not part of the patch, kept everything except the demo chats off screen. A vertical 9:16 cut
+for stories and reels is in [demo-9x16.mp4](demo-9x16.mp4).
 
 ![Focus Modes in Notifications and Sounds](screenshots/01-focus-modes.png)
 
